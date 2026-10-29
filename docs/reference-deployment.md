@@ -235,7 +235,7 @@ Outbound only:
 | OS and package mirrors | 443/TCP | Patches |
 | Upstream S3 | 443/TCP | Replication and restore |
 | Tenant egress allowlist | 443/TCP | Workload egress through the broker proxy |
-| Cloudflare Tunnel edge, optional | 7844/UDP or 443/TCP | Native tunnel only |
+| Cloudflare Tunnel edge, optional | 7844/UDP or 7844/TCP | Native tunnel only; TCP is the HTTP/2 fallback |
 
 Inbound from the internet: none.
 

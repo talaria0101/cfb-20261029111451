@@ -161,7 +161,8 @@ The default transport is one WebSocket per machine, terminated by a Durable
 Object. Billing is not one request per message. Cloudflare's DO pricing page
 says: a request is needed to create the WebSocket connection; outgoing messages
 and WebSocket protocol pings are free; incoming messages are billed at a 20:1
-ratio for request billing. A message is one fifth of the old assumption.
+ratio for request billing. Twenty incoming messages count as one billable
+request.
 
 Heartbeats, at one incoming message per machine every 15 seconds:
 

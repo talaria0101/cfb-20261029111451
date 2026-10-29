@@ -424,8 +424,9 @@ One WebSocket carries many logical streams. Frames are binary, not base64 JSON:
 
 - The control plane opens streams. The node never sends `open`; this prevents a
   compromised node from creating arbitrary server-side streams.
-- Each stream has a bounded queue. A slow stream cannot starve another. Cap each
-  queue at 16 KiB, following mirrord's protocol-io design.
+- Each stream has a bounded queue. A slow stream cannot starve another. Use a
+  256 KiB default per stream, configurable, following mirrord's tunnel FIFO
+  default.
 - Credit-based flow control per stream, in bytes. The receiver grants credit;
   the sender stops at zero.
 - Half-close is explicit. A request body and a response body may use the same

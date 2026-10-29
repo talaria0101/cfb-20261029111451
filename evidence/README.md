@@ -25,11 +25,9 @@ Caveats:
   exists. Read the licence file before depending on the project.
 - `NONE` means GitHub found no licence file.
 - Stars and last-push timestamps are a snapshot. They move.
-- The first batch fetch hit the 120-second shell timeout after 65 repositories.
-  The rest were fetched with `xargs -P 6`. The final file was produced from a
-  full re-fetch of all 98 names, not by appending two batches, so there are no
-  duplicates or gap rows. `daytonaio/daytona` was added afterwards with the same
-  API query, which makes 99.
+- The file was produced from a full re-fetch of the catalog names, not by
+  merging partial batches, so there are no duplicate or gap rows. Six rows were
+  appended on 2026-10-29 with the same API query, which makes 105.
 - `cloudflare/computer` resolves from `cloudflare/workspace`; the API returns the
   former name. It is kept as returned.
 - `cloudflare/sandbox` (a seccomp rules project) was removed. The Sandbox SDK is
@@ -59,6 +57,7 @@ SHA-256.
 | `blog.cloudflare.com_sandbox-ga_.md` | Sandbox general availability |
 | `developers.cloudflare.com_cloudflare-one_account-limits_.md` | Cloudflare One account limits |
 | `developers.cloudflare.com_cloudflare-one_networks_connectors_cloudflare-mesh_.md` | Cloudflare Mesh |
+| `developers.cloudflare.com_cloudflare-one_networks_connectors_cloudflare-tunnel_configure-tunnels_tunnel-with-firewall_.md` | Tunnel firewall ports, 7844 TCP and UDP |
 | `developers.cloudflare.com_containers_api_durable-object-container_.md` | Container Durable Object API |
 | `developers.cloudflare.com_containers_concepts_architecture_.md` | Containers architecture |
 | `developers.cloudflare.com_containers_platform_limits_.md` | Containers limits and instance types |

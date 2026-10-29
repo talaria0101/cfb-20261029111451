@@ -35,6 +35,7 @@ what remains unknown. It is an evidence log, not a narrative.
 | Cloudflare Container memory is $0.0000025/GiB-s, CPU $0.000020/vCPU-s, disk $0.00000007/GB-s | Containers pricing capture | Verified doc |
 | Containers include 25 GiB-h memory, 375 vCPU-min and 200 GB-h disk per month | Containers pricing capture | Verified doc |
 | Tunnels are free up to 1,000 per account, then $4.50 each | Tunnels for Platforms capture | Verified doc |
+| Cloudflare Tunnel uses port 7844, UDP for QUIC and TCP for HTTP/2 | Tunnel firewall capture | Verified doc |
 | D1 is capped at 10 GB per database | D1 limits capture | Verified doc |
 | A Durable Object is soft-capped at 1,000 req/s | DO limits capture | Verified doc |
 | Workers VPC is beta and free | Workers VPC capture | Verified doc |
@@ -47,7 +48,7 @@ what remains unknown. It is an evidence log, not a narrative.
 | MinIO is archived and AGPL-3.0 | GitHub API: `archived=true`, `AGPL-3.0` | Verified metadata |
 | cfrs does not implement tunnel registration or visitor serving | `src/tunnel/mod.rs` at commit `0cbf27d84c2f3091f69a83e2a75076b7738b278d` | Verified source |
 | ServerBee stores an argon2 hash of an agent-proposed token | `crates/server/src/service/agent_authority/mod.rs` and `auth.rs` at commit `ff409d112ab5808d541f225d23e6aa4689cdc34b` | Verified source |
-| mirrord caps per-stream queues at 16 KiB and uses bincode over WebSocket | mirrord README | Relayed |
+| mirrord uses bounded per-stream FIFOs; the tunnel default is 256 KiB | `mirrord/protocol-api/src/client/config.rs` at commit `1cd28b29b2bd218469f07b7b9c1b10a96d6247ac` | Verified source |
 | homelable has no agent or tunnel; it is LAN-only | homelable README | Relayed |
 | CoreObs agents write directly to Postgres | CoreObs README and agent docs | Relayed |
 | omnyssh uses native SSH and local `-L` forwarding only | omnyssh README | Relayed |
@@ -59,8 +60,9 @@ what remains unknown. It is an evidence log, not a narrative.
    WebSocket relay is the path that works today with no root, no UDP and no
    `cloudflared`. The native tunnel is Phase 2.
 2. **The node owns capabilities.** ServerBee reconciles a capability bitmask
-   against the real host and disables high-risk bits by default. CFB uses the
-   same ownership: the control plane schedules only what the node reports.
+   against the real host, and the server cannot enable a bit the agent did not
+   report. CFB uses the same ownership: the control plane schedules only what
+   the node reports.
 3. **One binary, runtime children.** The earlier design had a tunnel client, an
    agent, a proxy and a metrics process. `cfbd` replaces those. workerd, Podman,
    Incus, Firecracker and storage servers remain child processes because they are

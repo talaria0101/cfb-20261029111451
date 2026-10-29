@@ -74,7 +74,7 @@ about ten minutes. `Welcome` carries `protocol_version` and `report_interval`.
 Messages carry `msg_id` and are acknowledged. Admission is preflight-then-lock
 with `connection_id` fencing. One JSON WebSocket multiplexes metrics, PTY, exec,
 files and Docker. The capability bitmask is owned by the agent host and
-reconciled against real host ability; high-risk bits are off by default.
+reconciled against real host ability; temporary grants are host-local.
 
 Copy the protocol shape and the capability ownership. Do not copy the code:
 AGPL-3.0. Do not copy the root installer or the `--privileged` Docker agent.
@@ -82,14 +82,14 @@ AGPL-3.0. Do not copy the root installer or the `--privileged` Docker agent.
 ### 1.5 mirrord
 
 Rust workspace that runs a local process as if it were in a Kubernetes pod.
-Transport is bincode over a TCP port-forward (`61337`) or a WebSocket through the
-Kubernetes API server; one binary WebSocket message per bincode message.
+Transport is a binary protocol over a TCP port-forward or a WebSocket through the
+Kubernetes API server.
 
 Reuse three ideas: protocol versioning rules (renaming is compatible, appending
 an enum variant is compatible, adding a field is not; a separate crate version,
 `SwitchProtocolVersion`, and per-feature `VersionReq`), one multiplexed agent
-connection with per-stream queues capped at 16 KiB, and Prometheus gauges for
-queue depth.
+connection with bounded per-stream FIFOs (the tunnel default is 256 KiB), and
+Prometheus gauges for queue depth.
 
 Do not copy the Kubernetes assumptions or the targeted-mode privileges:
 `NET_ADMIN`, `SYS_PTRACE`, `SYS_ADMIN`, host PID and host mounts. The operator
@@ -106,12 +106,10 @@ port; one channel per visitor; the `copy_bidirectional` half-close discipline; a
 plain byte pipe from `proxy::connect_tunnel`; and the WebSocket transport
 wrapper. The rootless, no-TUN design is the right model for `lite`.
 
-Do not claim it is a working tunnel. `src/tunnel/mod.rs` states that registration
-and visitor serving are not implemented. `cfrs tunnel` is config and routing
-only. `cfrs metrics` prints a zeroed struct. The SSH host key check returns
-`Ok(true)`. `cfrs connect` does not use WebSocket despite its help text. It ships
-embedded Cloudflare-internal roots. A native tunnel needs the missing
-registration and serve loop.
+Do not claim it is a working tunnel. Its own README says `cfrs tunnel` does not
+serve traffic, registration and visitor serving are not implemented, and the
+HTTP/2 and QUIC transports build connections and frame messages but nothing
+consumes them. A native tunnel needs that missing registration and serve loop.
 
 ## 2. Workers platforms
 
