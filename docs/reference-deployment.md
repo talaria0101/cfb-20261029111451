@@ -1,304 +1,319 @@
 # Reference deployments
 
-Three concrete shapes, from one machine to a CI-heavy site. These are design
-recipes, not tested installers. Every command must be checked against the version
-of the tool you actually install.
+Status: design recipes, not tested installers. Check every command against the
+version you install. The common rule: create the control plane once on
+Cloudflare, enroll each machine once, and change everything else through the
+dashboard or API.
 
-The common rule: the control plane is created once on Cloudflare, each machine is
-enrolled once, and every later change goes through the dashboard or the API.
+## 1. Profiles
 
-## 1. Topology A: one machine
+| Profile | Root | Inbound TCP | Containers | VMs | Transport | Target |
+| --- | --- | --- | --- | --- | --- | --- |
+| `standard` | No | Loopback only | Rootless Podman | No | WSS relay | 4 GB+ VPS or home server |
+| `lite` | No | None | No | No | WSS relay | 512 MB to 1 GB VPS |
+| `strict` | No | None | No | No | WSS relay | Network that forbids all inbound |
+| `privileged` | Optional helper | Loopback only | Incus, Podman | Incus, Firecracker | WSS relay or native tunnel | KVM host, untrusted code |
 
-Use this to replace a single Cloudflare Containers workload or a single R2 bucket.
+`lite` and `strict` run trusted code only. They cannot isolate hostile tenants.
+`privileged` is the only profile that can.
+
+## 2. Topology A: one small machine (`lite`)
+
+Use this to replace one Workers project and one small bucket on a 512 MB VPS
+with no root.
 
 ```
 Cloudflare
   console Worker (SPA + API)
-  D1, R2, one DO per machine, Queues, Workflows
-  Tunnel: cfb-home-1
+  D1, R2, coordinator DO, relay DO, Queues
         |
-        | outbound QUIC 7844
+        | outbound wss:// on 443
         v
-  Machine: 16 vCPU, 64 GiB, 2 TB NVMe
-    cloudflared
-    cfb-agent
-    Incus (containers + VMs)
-    SeaweedFS (weed mini, S3 gateway on private net)
-    open-compute in an Incus VM (optional)
+  Machine: 1 vCPU, 512 MB to 1 GB, 20 GB disk
+    cfbd (unprivileged, one binary)
+      workerd child (Unix socket)
+      S3 gateway (local directory)
+      metrics and logs
 ```
 
-What runs where:
+What runs:
 
-- `cloudflared` and `cfb-agent` are systemd services.
-- Incus is the container and VM runtime. The agent talks to the Incus Unix
+- `cfbd` as a user service, not root.
+- One workerd process per tenant or trust group, receiving an inherited Unix
   socket.
-- SeaweedFS runs in `weed mini` mode. Its S3 gateway is reached through a
-  dedicated tunnel hostname, for example `s3-<site>.<domain>`, and presigned
-  URLs point at that hostname. The agent's own port is never on that hostname.
-  Do not put Access in front of the S3 hostname: a presigned request carries no
-  Access cookie or service token, so the S3 signature is the authorization.
-- open-compute is optional. If present, it runs inside an Incus VM, one VM per
-  tenant or trust group, and the agent routes a Worker hostname to the VM's
-  address. Do not run it on the host loopback with untrusted tenants.
+- Static files served by workerd.
+- A local directory for objects, with an optional upstream S3 over outbound 443.
+- No Podman, no Docker socket, no TUN, no netns, no FUSE.
+
+What does not run: containers, microVMs, CI, native tunnel, privileged helpers.
+
+Resource budget: keep `cfbd` under 30 MiB RSS and workerd under 80 MiB per idle
+tenant, leaving headroom on a 512 MB machine. These are targets, not measured.
+
+## 3. Topology B: one standard machine
+
+Use this to replace a Cloudflare Containers workload, a tunnel and a local
+reverse proxy.
+
+```
+Cloudflare
+  console Worker, D1, R2, coordinator DO, relay DO, Queues, Access
+        |
+        | outbound wss:// on 443
+        v
+  Machine: 16 vCPU, 64 GiB, 2 TB NVMe
+    cfbd (systemd, user cfb)
+      workerd children
+      rootless Podman
+      SeaweedFS or RustFS (optional, local S3)
+      GitHub runner or Woodpecker agent (optional)
+```
+
+- `cfbd` talks to the rootless Podman socket at
+  `$XDG_RUNTIME_DIR/podman/podman.sock`.
+- Storage is the embedded S3 gateway over local NVMe. For multi-node durability,
+  point it at SeaweedFS or RustFS.
+- One relay socket per machine. No `cloudflared`.
+- Public ingress routes through the relay to a workload's Unix socket or
+  loopback port. No host port is bound to a public interface.
 
 This machine can host about 8 standard-2 equivalent containers at 80% memory
-utilization, and up to 10 at 100%, before storage and headroom. It is a single failure domain.
-Do not put irreplaceable data on it without an R2 replica.
+utilization. It is one failure domain. Do not put irreplaceable data on it
+without an R2 replica.
 
-## 2. Topology B: a three-machine site
-
-Use this for a small production site with storage redundancy.
+## 4. Topology C: three-machine site (`privileged`)
 
 ```
 Site "rack-a"
-  machine-a: Incus cluster member, SeaweedFS master + volume, cfb-agent
-  machine-b: Incus cluster member, SeaweedFS volume, cfb-agent
-  machine-c: Incus cluster member, SeaweedFS volume + S3 gateway, cfb-agent
+  machine-a: Incus member, storage master, cfbd
+  machine-b: Incus member, storage volume, cfbd
+  machine-c: Incus member, storage volume and S3 gateway, cfbd
 
-  each: cloudflared + cfb-agent + one tunnel
-  storage: 3 replicas hot, EC 4+2 for warm (needs 6 drives or 6 nodes;
-           with 3 nodes use 3-way replication)
-  public ingress: one hostname route per workload, Access in front
+  each: one cfbd, one relay socket
+  storage: 3-way replication for 3 nodes
+  ingress: one route per workload, Access in front
 ```
 
 Rules:
 
-- Three machines is the minimum for an Incus cluster with a distributed database
-  that can lose one member.
-- With three storage nodes, use 3-way replication, not erasure coding. Erasure
-  coding needs more failure domains to pay off.
-- One tunnel per machine. A site-level tunnel is a fallback for very large sites,
-  not the default.
-- Put the SeaweedFS master on a stable node and give it a fixed address on the
-  private network. Do not put the master on the same node as the only S3 gateway.
-- The S3 gateway listens on the private network and is exposed through a
-  dedicated tunnel hostname, not the public internet directly. Presigned URLs
-  point at that hostname. The S3 signature is the authorization; do not put
-  Access in front of it.
+- Three machines is the minimum for a cluster that can lose one member.
+- With three storage nodes use 3-way replication. Erasure coding needs more
+  failure domains to pay off.
+- One socket per machine. A site-level socket is a fallback for very large
+  sites, not the default.
+- Put the storage master on a stable node with a fixed private address.
+- The S3 gateway listens on the private network and is exposed as
+  `s3-<site>.<domain>`. Presigned URLs point there. Do not put Access in front of
+  that hostname; the S3 signature is the authorization.
+- The privileged helper is installed only if Incus or Firecracker is needed. It
+  is not part of `cfbd` and is not installed by default.
 
-Capacity: three 16 vCPU / 64 GiB machines give about 24 standard-2 containers
-at 80% memory utilization, and up to 30 at 100%, minus the storage and agent
-overhead.
+Capacity: three 16 vCPU / 64 GiB machines give about 24 standard-2 containers at
+80% memory utilization, minus storage and broker overhead.
 
-## 3. Topology C: CI-heavy site
-
-Use this when the motivating workload is heavy CI.
+## 5. Topology D: CI-heavy site
 
 ```
 Site "ci"
-  runner-a: Fireactions pool "linux-x64-large", 32 vCPU, 128 GiB, 2 TB NVMe
-  runner-b: Fireactions pool "linux-x64-large", 32 vCPU, 128 GiB, 2 TB NVMe
-  cache-1:  SeaweedFS S3 for caches and artifacts, 4 TB NVMe
+  runner-a: 32 vCPU, 128 GiB, 2 TB NVMe, cfbd with the ci feature
+  runner-b: 32 vCPU, 128 GiB, 2 TB NVMe, cfbd with the ci feature
+  cache-1:  S3 for caches and artifacts, 4 TB NVMe
   build-1:  Incus for long-running build services (optional)
 
-  each: cloudflared + cfb-agent + one tunnel
-  GitHub App / webhook -> control plane -> pool DO -> runner agent
+  GitHub App or webhook -> control plane -> coordinator DO -> relay -> cfbd
   logs -> R2, artifacts -> local S3 -> R2 replica
 ```
 
-Sizing notes:
+Sizing:
 
-- A Firecracker runner VM per job needs a warm rootfs and a warm toolchain. Keep
-  a pool of at least 2 idle VMs per concurrent job target, or accept a cold-start
-  penalty.
-- CI is bursty. Size for the burst, not the average, or use a queue with a
-  concurrency cap and let jobs wait.
+- One Firecracker VM per job needs a warm rootfs and toolchain. Keep two idle
+  VMs per concurrent job target, or accept cold starts.
+- CI is bursty. Size for the burst or cap concurrency and let jobs wait.
 - The cache bucket is the difference between a 4-minute and a 20-minute build.
-  Mount it or sync it before the job starts.
-- Keep job secrets envelope-encrypted in the control plane, inject them at
-  start, and mask them in logs. Never bake them into the runner image.
-- A 20-minute Cloudflare Workers Builds timeout is the reason this site exists.
-  Set a longer timeout here, with a hard cap and a disk quota.
+- Secrets are envelope-encrypted, injected at start, masked in logs.
+- This site exists because Workers Builds has a 20-minute job timeout, a
+  6-concurrent-build limit and a 4 vCPU / 8 GB / 20 GB build machine.
+- CI is not available in `lite`.
 
-## 4. Software matrix
+## 6. Software matrix
 
-| Machine role | Software | Port | Exposure |
+| Role | Software | Listen | Exposure |
 | --- | --- | --- | --- |
-| Every machine | `cloudflared` | outbound 7844/UDP, 443/TCP fallback | Outbound only |
-| Every machine | `cfb-agent` | 127.0.0.1:9443 and /run/cfb/agent.sock | Loopback and local socket |
-| Container/VM host | Incus | Unix socket | Local only |
-| Container host | containerd | Unix socket | Local only |
-| Sandbox host | Firecracker + jailer | vsock, Unix socket | Local only |
-| Storage | SeaweedFS master/volume/S3 | 9333, 8080, 8333 on private net | Private net and S3 hostname route |
-| Workers | open-compute `ocd` (in an Incus VM) | VM loopback HTTP | Tunnel route to the VM |
-| Workers (minimal) | workerd (in an Incus VM or dedicated machine) | VM loopback HTTP | Tunnel route to the VM |
-| CI (GitHub) | Fireactions | loopback API | Loopback, tunnel route |
-| CI (Gitea) | Woodpecker server + agent | 8000/9000 on private net | Tunnel route for UI |
-| Observability | OTel collector, Prometheus, Loki | private net | Private net |
+| Every node | `cfbd` | `/run/cfb/cfbd.sock` or `$XDG_RUNTIME_DIR/cfb/cfbd.sock` | Local socket, mode 0660 |
+| Workers | workerd child | Inherited Unix socket | Local socket |
+| Containers | rootless Podman | `$XDG_RUNTIME_DIR/podman/podman.sock` | Local socket |
+| Containers and VMs | Incus | `/var/lib/incus/unix.socket` | Local socket |
+| Sandboxes | Firecracker and jailer | vsock, Unix socket | Local |
+| Storage | SeaweedFS or RustFS | private network ports | Private network and S3 hostname |
+| CI (GitHub) | Actions runner | outbound 443 | Outbound only |
+| CI (Gitea) | Woodpecker agent | outbound 443 | Outbound only |
+| Observability | OTel collector | private network | Private network |
 
-No tenant workload listens on a host port. Ingress is a tunnel route to the
-agent, and the agent proxies to the workload's loopback or private address.
+No tenant workload listens on a public host port. Ingress is a relay stream to
+`cfbd`, which proxies to a local socket or loopback port.
 
-## 5. Bootstrap order
+## 7. Bootstrap
 
-1. **Cloudflare account.** Create the Workers Paid plan, a D1 database, an R2
-   bucket, a Queue, and the Access application for the console.
+1. **Cloudflare.** Workers Paid, one D1 database, one R2 bucket, one Queue, the
+   console Access application, and the Durable Object namespaces.
 2. **Control plane.** Deploy the SPA and API. Set `ACCOUNT_ID`, `TEAM_DOMAIN`,
-   `ACCESS_AUD`, `D1`, `R2`, `QUEUE` and the DO bindings as secrets or vars.
-3. **Tunnel.** Create one tunnel per machine with `config_src=cloudflare`. Store
-   the token as a systemd credential on the machine, not in a file.
-4. **Machine base image.** Install the OS, a non-root `cfb` user, `cloudflared`,
-   the agent, and the runtime (Incus, Firecracker, SeaweedFS, open-compute).
-5. **Enroll.** Generate a one-time join token in the dashboard, run the install
-   command, wait for the first heartbeat.
-6. **Smoke test.** The agent creates a network namespace, starts a tiny container,
-   runs `true`, and reports success. The machine becomes `ready`.
-7. **First workload.** Create a container or a Worker from the dashboard. Watch
-   the operation, the event stream and the audit record.
-8. **Backup.** Enable replication to R2 and run a restore drill before calling the
+   `ACCESS_AUD`, the D1, R2, Queue and DO bindings. Store secrets as Workers
+   secrets or Secrets Store bindings.
+3. **Machine.** Create the `cfb` user, a data directory, and install `cfbd` from a
+   signed release. Verify the signature and the SHA-256 before execution.
+4. **Enroll.** Create a machine in the dashboard, copy the one-time join token
+   (15 minutes), run `cfbd enroll --token ... --profile lite`. The broker
+   generates its key, enrolls the public key, and receives a 24-hour credential.
+5. **Smoke test.** The broker writes a minimal workerd config, starts workerd on
+   a Unix socket, requests `/`, and reports success. The machine becomes `ready`.
+6. **First workload.** Deploy a Worker bundle or a container from the dashboard.
+   Watch the operation, the event stream and the audit record.
+7. **Backup.** Enable replication to R2 and run a restore drill before calling the
    machine production.
 
-## 6. workerd on a machine, exposed through the tunnel
+The install command is a shape, not a tested script. The broker CLI and flags do
+not exist yet.
 
-There are two supported modes.
+## 8. Running workerd
 
-### 6.1 open-compute mode (recommended)
+### 8.1 Standard mode
 
-1. Create an Incus VM for the tenant or trust group, with a default-deny egress
-   policy that blocks the host loopback and the metadata address.
-2. Install `ocd` from a pinned release inside that VM.
-3. Create one open-compute instance per tenant or trust group with its own data
-   directory.
-4. Deploy a bundle with the open-compute CLI or its `/client/v4` API.
-5. Bind the instance to the VM's loopback address.
-6. Add a tunnel hostname route to the VM address, with Access in front.
-7. The agent records the deployment id, the bundle hash and the health check.
+1. `cfbd` parses `wrangler.jsonc` and rejects unsupported bindings.
+2. It generates `workerd.capnp` with one socket inherited from the broker.
+3. It generates the binding shim for R2, D1, KV and Queues and writes it into the
+   version directory.
+4. It starts `workerd serve workerd.capnp --socket-fd http=3` as the `cfb` user.
+5. It waits for a health request, then swaps the route pointer atomically.
+6. It keeps the previous version until the next successful deploy.
 
-The control plane does not need to know how open-compute stores state. It calls
-the documented API and stores the deployment metadata.
+`workerd` is not a hardened sandbox. For hostile code, run it inside a
+Firecracker VM in the `privileged` profile. For `lite`, run trusted code only.
 
-### 6.2 raw workerd mode (fallback)
+### 8.2 Optional open-compute mode
 
-Use this only if you need a binding that open-compute does not support.
+If the application needs the broader Workers API surface that open-compute
+implements, run `ocd` inside a VM and let `cfbd` supervise it as a child. This
+adds a second binary and is not part of the `lite` build. open-compute is
+single-node and not HA.
 
-1. Write a Cap'n Proto config that defines the Worker and a socket on
-   `127.0.0.1:8080`.
-2. Run `workerd serve /etc/workerd/config.capnp`.
-3. If you need a privileged port, use the systemd socket-activation pattern from
-   the workerd README: `--socket-fd http=3` with a `.socket` unit. For this
-   design, bind loopback and let the tunnel route to it, so no privileged port is
-   needed.
-4. Run it inside an Incus VM or a dedicated machine. workerd is not a hardened
-   sandbox; do not run hostile code directly on the host.
-5. Add a tunnel route and an Access policy.
-
-The systemd unit is:
+### 8.3 Unit shape
 
 ```ini
 [Unit]
-Description=workerd runtime
+Description=CFB broker
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=exec
-ExecStart=/usr/bin/workerd serve /etc/workerd/config.capnp
+ExecStart=/usr/local/bin/cfbd run --config /etc/cfb/cfbd.toml
 Restart=always
-User=workerd
-Group=workerd
+User=cfb
+Group=cfb
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/workerd
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/cfb
+StateDirectory=cfb
+RuntimeDirectory=cfb
 ```
 
-This is a shape, not a tested unit. Check it against the workerd version you
-install.
+This is a shape. Check it against your systemd version and the broker's actual
+flags. `lite` and `strict` add `IPAddressAllow` for the relay and upstream S3
+only, and no `ListenStream`.
 
-### 6.3 What the tunnel exposes
-
-- The agent, on a machine-internal hostname, for control traffic.
-- Each public Worker hostname, routed to the open-compute VM or the local workerd port.
-- Optional Access policies per hostname.
-- No direct access to the open-compute dashboard, the VM's SSH port, or the
-  machine's Incus socket.
-
-## 7. Network and firewall
+## 9. Network and firewall
 
 Outbound only:
 
 | Destination | Port | Purpose |
 | --- | --- | --- |
-| Cloudflare Tunnel edge | 7844/UDP (QUIC) | Tunnel transport |
-| Cloudflare Tunnel edge | 443/TCP | Fallback if QUIC is blocked |
+| Relay and API | 443/TCP | WSS transport and enrollment |
 | Container registries | 443/TCP | Image pulls |
 | OS and package mirrors | 443/TCP | Patches |
-| Tenant egress allowlist | 443/TCP | Workload egress via proxy |
+| Upstream S3 | 443/TCP | Replication and restore |
+| Tenant egress allowlist | 443/TCP | Workload egress through the broker proxy |
+| Cloudflare Tunnel edge, optional | 7844/UDP or 443/TCP | Native tunnel only |
 
-Inbound from the internet: none. Listeners are loopback, the local agent
-socket, and the private site network for SeaweedFS, Woodpecker and
-observability. Restrict those private ports to the site subnet and block tenant
-namespaces.
+Inbound from the internet: none.
 
-If the network blocks UDP 7844, `cloudflared` falls back to HTTP/2 over 443. Test
-both paths. A network that breaks long-lived connections will break the tunnel;
-set `--protocol http2` explicitly if needed.
+Local listeners:
 
-## 8. Verification checklist
+- `cfbd.sock`, mode 0660.
+- The Podman or Incus socket, accessible to the `cfb` user only.
+- Private network ports for storage and observability, restricted to the site
+  subnet and blocked from tenant namespaces.
 
-Before calling a site production:
+`lite` and `strict` have no `ListenStream` at all. If a dependency demands a TCP
+port, it does not belong in those profiles.
 
-- [ ] The machine enrolls in under 10 minutes with no SSH.
-- [ ] The agent heartbeats every 15 seconds; the dashboard shows fresh state.
-- [ ] Stopping the control plane does not stop a running container.
+If the network breaks long-lived WebSockets, the broker reconnects with jitter
+and resumes streams. Test this before production. If the network blocks
+WebSocket upgrade entirely, only a native tunnel over HTTP/2 or a different
+network can help.
+
+## 10. Verification checklist
+
+- [ ] The machine enrolls in under 10 minutes with no SSH and no root.
+- [ ] The dashboard shows a heartbeat every 15 seconds.
+- [ ] Stopping the control plane does not stop a running workload.
 - [ ] Restarting the control plane reconciles without duplicating workloads.
-- [ ] Revoking the machine credential and key blocks the agent within one
-  heartbeat.
-- [ ] A container cannot reach the agent, the metadata address or another tenant.
-- [ ] A sandbox cannot reach the host or another sandbox.
-- [ ] A Worker bundle with a bad signature is rejected.
+- [ ] Revoking the credential and key blocks the broker within one heartbeat.
+- [ ] The broker has no TCP listener in `lite` and `strict`.
+- [ ] A container cannot reach the broker socket, the metadata address or
+      another tenant.
+- [ ] A microVM cannot reach the host or another microVM.
+- [ ] A bundle with a bad signature is rejected.
+- [ ] An unsupported binding is rejected at deploy with a named error.
 - [ ] A deleted object is gone locally and from the replica per policy.
 - [ ] A restore from R2 matches the checksum.
-- [ ] A disk failure (simulated by stopping a node) does not lose data.
+- [ ] A stopped storage node does not lose data.
 - [ ] A CI job longer than 20 minutes completes.
 - [ ] A cancelled CI job destroys its runner within 60 seconds.
 - [ ] The audit chain verifies, and a tampered row fails.
 - [ ] A second tenant cannot read the first tenant's resources by id.
-- [ ] The tunnel has no inbound port open on the machine.
+- [ ] The relay socket is the only outbound control connection.
 
-## 9. Upgrade order
+## 11. Upgrade order
 
-1. **Control plane**, expand-only migration. Deploy the new code, keep the old
-   code compatible with the new schema.
-2. **Agent**, canary on one machine. Health check and rollback on failure.
-3. **Runtime** (Incus, Firecracker, SeaweedFS, open-compute), one machine at a
-   time. Drain first if the runtime restart affects workloads.
-4. **Contract migration**, after all agents and the control plane are on the new
+1. **Control plane**, expand-only migration.
+2. **Broker**, canary on one machine. Health check and roll back on failure.
+3. **Runtime** (workerd, Podman, Incus, storage), one machine at a time. Drain
+   first if the restart affects workloads.
+4. **Contract migration**, after all brokers and the control plane are on the new
    version. Never drop a column the old code still reads.
-5. **Storage**, one node at a time, wait for replication to catch up before the
-   next.
+5. **Storage**, one node at a time, wait for replication before the next.
 
-## 10. Failure drills
+## 12. Failure drills
 
-Run these before production, then quarterly:
-
-1. **Control-plane outage.** Block the agent's egress to Cloudflare for 15
-   minutes. Containers keep running, the agent queues events, and the dashboard
-   shows stale state. Restore and verify reconciliation.
-2. **Tunnel outage.** Stop `cloudflared` for 5 minutes. Public ingress fails,
-   workloads keep running, the agent reconnects.
-3. **Machine power loss.** Pull power on one node. The Incus cluster and storage
+1. **Control-plane outage.** Block broker egress for 15 minutes. Workloads keep
+   running, events queue, the dashboard shows stale state. Restore and verify
+   reconciliation.
+2. **Relay outage.** Stop the relay DO or block the socket for 5 minutes. Public
+   ingress fails, workloads keep running, the broker reconnects.
+3. **Machine power loss.** Pull power on one node. The cluster and storage
    survive; the control plane marks the machine offline. Restart and verify no
    duplicate workloads.
 4. **Disk failure.** Remove one storage node. Reads and writes continue; rebuild
    completes; no checksum mismatch.
 5. **Restore.** Restore a random object and a D1 export into a scratch
    environment. Compare hashes.
-6. **Revocation.** Revoke a machine credential and key. Verify the agent cannot
-   reconnect, even with a valid tunnel token.
-7. **Break-glass.** Use the audited exec path to a machine with a stopped agent.
+6. **Revocation.** Revoke a credential and key. Verify the broker cannot
+   reconnect.
+7. **Break-glass.** Use the audited exec path to a machine with a stopped broker.
    Verify the session is recorded and expires.
+8. **Constrained node.** Confirm no inbound port, no root, no capability, and
+   that a workerd crash does not affect the host.
 
 Each drill produces a record: what was done, what happened, how long it took, and
-what changed as a result.
+what changed.
 
-## 11. What this reference does not include
+## 13. Not included
 
-- Terraform or Wrangler configuration. The control plane's infrastructure should
-  be codified, but that code does not exist yet.
-- An installer. The install script is described, not written.
-- Tested versions. Pin versions and read the release notes.
-- Hardware prices. See `docs/cost.md` for the parametric model.
-- A multi-site setup. Start with one site; add a second only after the first
-  survives the drills.
+- Terraform or Wrangler infrastructure code.
+- An installer.
+- Tested versions.
+- Hardware prices. See `docs/cost.md`.
+- A multi-site setup. Start with one site and add a second after the drills.

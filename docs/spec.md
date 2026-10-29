@@ -1,976 +1,888 @@
 # CFB specification
 
 Status: design draft, 2026-10-29. No implementation is claimed or included.
-Working name: CFB (Cloudflare Backplane). Rename freely.
 
-## 1. Summary
+## 1. Scope
 
-CFB is a two-plane system.
+### 1.1 Problem
 
-The **control plane** is a Cloudflare Workers application. It owns identity,
-inventory, desired state, policy, audit, the dashboard and the public API. It
-uses D1 for relational metadata, R2 for artifacts, one Durable Object per machine
-for leases and live state, Queues for command fanout, Workflows for long-running
-sagas, Access for human authentication, and Cloudflare Tunnel plus Workers VPC
-for private connectivity.
+Cloudflare's data-plane products are convenient until a workload needs a
+long-lived process, a large local disk, a private network, a GPU, predictable
+egress, or a machine the operator already owns. Moving that workload off
+Cloudflare usually means rewriting it against a different API. CFB exists to
+avoid that rewrite.
 
-The **data plane** is a set of machines you own. Each machine runs a single
-outbound-only host agent, `cloudflared`, and one or more local runtimes: Incus or
-containerd for containers and VMs, Firecracker for sandboxes, open-compute or
-workerd for Workers-compatible code, SeaweedFS or RustFS for S3, and Woodpecker
-or Fireactions for CI.
+The control plane stays on Cloudflare. A single daemon on each machine, `cfbd`,
+implements the same data-plane contracts locally. The same Worker bundle, S3
+client, OCI image or CI workflow is intended to run on either side. The deploy
+target changes; the application source does not.
 
-The control plane stores intent. The data plane stores execution. The data plane
-keeps running when the control plane is unavailable. The control plane is never
-in the request path of a tenant workload, except for optional public ingress
-through Cloudflare Tunnel and Access.
+### 1.2 Invariants
 
-The design is a smaller, narrower system than Cloudflare. It does not aim for a
-global anycast edge, 100,000-container bursts, or 648 ms sandbox starts. It
-aims for a manageable fleet of machines, with predictable costs, strong local
-performance, and a dashboard that works from anywhere.
+1. **Portable artifact.** The unit of deployment is the artifact Cloudflare
+   already accepts: a Workers bundle and `wrangler.jsonc`, an OCI image, an S3
+   request, a GitHub Actions workflow. CFB does not define a parallel application
+   API.
+2. **One CFB daemon per machine.** `cfbd` replaces the tunnel client, host agent,
+   local router, metrics agent and local orchestrator. Runtime children are
+   processes it supervises, not separate CFB control planes.
+3. **Outbound only.** The node initiates every connection. There is no inbound
+   listener on a public interface. The default transport is WebSocket over 443.
+4. **Control plane optional for execution.** A running workload continues when
+   Cloudflare is unreachable. The node reconciles its last desired state.
+5. **Least privilege by default.** `cfbd` runs as an unprivileged user. Root and
+   kernel features are opt-in and reported as capabilities.
+6. **Fail closed.** An unsupported binding, missing capability or failed
+   signature stops the deployment with a named error. It does not silently
+   degrade.
+7. **One authority per fact.** D1 owns inventory. A per-machine Durable Object
+   owns the lease. The node's SQLite owns observed runtime state. Local storage
+   owns object bytes. R2 owns the offsite copy.
+8. **Testable compatibility.** Compatibility claims are backed by a conformance
+   suite that runs the same artifact against Cloudflare and a node. A claim
+   without a test is a target, not a result.
 
-## 2. Problem and constraints
+### 1.3 Non-goals
 
-### 2.1 What is being replaced
+- A global anycast edge or a multi-region active-active control plane.
+- Reimplementing Cloudflare's proprietary services: Images, Stream, AI, Vectorize,
+  Hyperdrive, Browser Rendering, R2 event notifications, D1 read replication.
+- A new container runtime, hypervisor, S3 server or CI engine written from
+  scratch. CFB supervises existing ones.
+- Running hostile multi-tenant code in a shared-kernel container or in workerd
+  alone.
+- Exact behavioural parity for every Cloudflare API. The supported subset is
+  explicit.
 
-| Cloudflare service | Why it becomes expensive or limiting | CFB replacement |
+### 1.4 Terms
+
+- **Node**: one machine running `cfbd`.
+- **Broker**: the `cfbd` process and its supervised children.
+- **Relay**: the Cloudflare Worker and Durable Object that terminate the node's
+  outbound WebSocket.
+- **Profile**: the capability and privilege set a node runs with: `standard`,
+  `lite` or `privileged`.
+- **Artifact**: a Workers bundle, OCI image, S3 object, or CI workflow.
+- **Capability**: a runtime feature the node reports, such as `workerd`,
+  `oci_rootless`, `kvm` or `s3_local`.
+
+## 2. Portability contract
+
+### 2.1 Layers
+
+Compatibility is claimed at four layers, weakest first:
+
+| Layer | Meaning | How it is checked |
 | --- | --- | --- |
-| R2 | Storage is cheap, but capacity is rented forever; locality and egress patterns vary | Local S3 (SeaweedFS or RustFS), with R2 as cold tier and offsite backup |
-| Containers | Billed per 10 ms of running time; egress charged; instance sizes capped by default and raised on request; HTTP-only ingress; no raw TCP | Incus or containerd on owned machines, with Tunnel ingress and VPC control |
-| Sandbox | Billed per 10 ms while running, 6-hour inactivity cap, rootfs-only snapshots, no raw TCP | Firecracker microVMs with snapshots and a small sandbox API |
-| Computer | Early preview library, Cloudflare-hosted; a workspace over a container/isolate | A local workspace service over a sandbox or container, with a durable filesystem |
-| Workers | CPU and request billing, runtime limits, no long-running processes | open-compute or workerd on a machine, exposed through Tunnel |
-| Durable Objects | Request and duration billing, 10 GB per object, single-threaded | open-compute DO for single-node, celld or Rivet for distributed actors |
-| Workers CI | Build minutes, 20-minute timeout, 6 concurrent builds, Cloudflare-hosted | Woodpecker or Fireactions on owned runners, with artifacts in local S3 |
-| Workers VPC / Tunnel | Free at small scale, but account limits and per-tunnel pricing beyond 1,000 | Tunnel per machine plus an account-wide VPC binding; a relay fallback; optional self-hosted overlay |
+| Source | Application source compiles and imports without edits | Build the same bundle for both targets |
+| Configuration | The same `wrangler.jsonc` binding names and values are accepted | Parse and validate the config |
+| Protocol | The wire contract is the same: S3, OCI, HTTP, WebSocket, GitHub runner | Run the same client or image |
+| Semantics | Behaviour matches: SQL, DO alarms, R2 consistency, queue delivery | Conformance suite against both targets |
 
-The prices and limits above are Cloudflare's list values read on 2026-10-29. The
-sources are in section 21 and in `docs/cost.md`.
+CFB targets source, configuration and protocol compatibility. Semantic
+compatibility is a measured result per primitive, not a blanket promise.
 
-### 2.2 Hard constraints
+### 2.2 Matrix
 
-1. The dashboard and manager must be hosted on Cloudflare and usable from there.
-2. Machines are behind NAT or a firewall. No inbound ports can be opened.
-3. The control plane must not be a single point of failure for running workloads.
-4. The system must run long-lived containers, heavy CI jobs, sandboxes and
-   Workers-compatible code on the same fleet.
-5. Multi-tenant isolation must be explicit, not implied by a namespace.
-6. The design must be operable by a small team, not a 24/7 platform organization.
-7. Licensing must be compatible with self-hosting and, if the system is offered
-   to others, with a hosted service.
+| Contract | Cloudflare | Node | Same artifact | Boundary |
+| --- | --- | --- | --- | --- |
+| Workers module | Workers V8 isolate | workerd | Yes | `fetch`, `env`, `ctx`, service bindings, DO |
+| Durable Objects | Cloudflare DO with SQLite | workerd DO with SQLite | Yes | Alarms and hibernation; no location hints |
+| R2 binding | `env.BUCKET` | S3 gateway through a generated shim | Yes | S3 operations in the supported subset |
+| External S3 | R2 S3 API | S3 gateway or upstream S3 | Yes | AWS SDK endpoint changes only |
+| D1 binding | `env.DB` | SQLite through a generated shim | Yes | SQL subset; no read replication |
+| KV binding | `env.KV` | SQLite through a generated shim | Yes | Local strong reads; no global eventual model |
+| Queues binding | `env.QUEUE` | SQLite queue through a generated shim | Yes | At-least-once; no global ordering |
+| Containers | Cloudflare Containers | Rootless Podman or Docker | Image yes | Cloudflare container API is not emulated |
+| CI | GitHub Actions | GitHub runner or Fireactions | Workflow yes | Runner binary and container runtime required |
+| CI | Gitea or Forgejo | Woodpecker | Workflow yes | Different pipeline syntax from GitHub |
+| Tunnel | Cloudflare Tunnel | WSS relay or native tunnel | Route config translates | No `cloudflared` process |
+| Access | Cloudflare Access | Cloudflare Access | Yes | Control plane stays on Cloudflare |
 
-### 2.3 Soft constraints
+The shims are generated at deploy time. They wrap the user's module and populate
+`env` with objects that implement the binding methods over the node's local
+services. The user's source is not edited.
 
-- Prefer Apache-2.0 or MIT components.
-- Prefer one binary or one daemon per machine over a service mesh.
-- Prefer local consistency over global coordination.
-- Prefer boring, replaceable components over novel ones.
-- Keep the control plane cheap; spend the money on machines and bandwidth.
+### 2.3 Supported Workers subset
 
-## 3. Goals and non-goals
+Native in workerd:
 
-### 3.1 Goals
+- ES module `export default { fetch }`, `scheduled`, `queue` handlers where
+  workerd exposes them.
+- `env` plain values and secrets.
+- Service bindings between Workers in the same node.
+- Durable Object classes, SQLite storage, alarms, hibernating WebSockets.
+- Outbound `fetch` through the node's egress policy.
 
-- Provision a new machine into the fleet from the dashboard, with no SSH.
-- Create, start, stop, snapshot, migrate and delete containers, VMs, sandboxes,
-  Workers and CI runners from the dashboard.
-- Keep workloads running through a control-plane outage.
-- Reach every machine through an outbound-only connection.
-- Isolate untrusted code with a VM boundary.
-- Store tenant objects in local S3, with an offsite copy in R2.
-- Give every mutation an actor, a request id and an audit record.
-- Make cost visible per tenant, machine and workload.
-- Allow a component to be replaced without rewriting the control plane.
+Generated shim:
 
-### 3.2 Non-goals
+- R2 bucket: `head`, `get`, `put`, `delete`, `list`, multipart upload.
+- D1: `prepare`, `bind`, `first`, `all`, `run`, `batch`, `exec`.
+- KV: `get`, `put`, `delete`, `list`.
+- Queues: `send`, `sendBatch`, consumer handler.
 
-- Global anycast or a multi-region active-active control plane.
-- Exact Cloudflare API compatibility.
-- A hypervisor, an S3 server, a CI engine, a Durable Object runtime or a
-  container runtime written from scratch.
-- 100,000-instance bursts or sub-second cold starts.
-- A billing marketplace in the first version.
-- Windows guests in the first version.
-- Running hostile multi-tenant code in a shared-kernel container.
+Not supported on a node:
 
-## 4. Design principles
+- Cloudflare-only bindings: AI, Vectorize, Hyperdrive, Browser Rendering,
+  Images, Stream, Analytics Engine SQL, R2 event notifications, D1 read
+  replication, DO location hints, Workers Builds API.
+- `wrangler` features that require the Cloudflare API: secrets store, tail
+  consumers, custom domains managed by Wrangler, gradual deployments.
 
-1. **Split the planes, invert the dependency.** The control plane describes what
-   should exist. The data plane decides how to make it exist and keeps doing so
-   when the control plane is unreachable.
-2. **Outbound only.** Machines initiate every connection. `cloudflared` is the
-   only ingress path. No public SSH, no public agent port, no public database.
-3. **Desired state, not remote shell.** There is no SSH-based provisioning path.
-   The agent reconciles a versioned specification and reports observed state.
-4. **One authority per fact.** D1 owns inventory. The per-machine DO owns the
-   lease. The local SQLite DB owns runtime state. Local S3 owns object bytes. R2
-   owns the offsite copy. No fact is written in two places as a primary.
-5. **Isolation by workload class.** Untrusted code gets a microVM. Trusted code
-   gets a container. High-trust code gets a dedicated machine. workerd runs
-   inside a VM or container because it is not a hardened sandbox.
-6. **Replaceable components.** Incus, Firecracker, open-compute, celld, SeaweedFS
-   and Woodpecker sit behind driver interfaces. A better component should not
-   require a control-plane rewrite.
-7. **Fail closed, audit everything.** Deny by default, use short-lived
-   credentials, sign artifacts, and record every mutation in a hash chain.
-8. **Cost honesty.** Self-hosting is not free. The design makes idle cost,
-   redundancy cost and operator time visible instead of hiding them.
+A config that uses an unsupported binding fails validation before deploy. A
+runtime call to an unimplemented method throws `UnsupportedBindingError` with
+the binding name and method.
 
-## 5. Architecture
+### 2.4 Deploy flow
 
-### 5.1 Component diagram
+1. CI builds the Worker with `wrangler deploy --dry-run --outdir dist`. The
+   output is the same bundle Cloudflare would receive.
+2. The control plane stores the bundle, its SHA-256, the `wrangler.jsonc` and the
+   signature.
+3. The target node verifies the hash and signature, parses the config, generates
+   the binding shim, writes a workerd Cap'n Proto config, and starts or reloads
+   workerd.
+4. The node runs a smoke request against the new version. On success it moves
+   the route pointer atomically. On failure the previous version stays live.
+5. The same bundle can be deployed to Cloudflare with `wrangler deploy` without
+   rebuilding.
+
+The deploy command changes from `wrangler deploy` to a CFB upload command. The
+application source and the bundle do not.
+
+### 2.5 Failure behaviour
+
+- Unsupported config: reject at upload with the binding path and the reason.
+- Missing capability: reject at placement; do not schedule to a node that cannot
+  run it.
+- Shim method not implemented: throw at first call; do not return a plausible
+  wrong value.
+- Semantic mismatch found by conformance: mark the primitive unsupported for
+  that release; do not claim parity.
+
+## 3. Architecture
+
+### 3.1 Diagram
 
 ```
-+------------------------------- Cloudflare account --------------------------------+
-|                                                                                    |
-|  Browser                                                                           |
-|    |  HTTPS + Access cookie                                                         |
-|    v                                                                               |
-|  +------------------+      +----------------------+      +----------------------+  |
-|  | console Worker   |----->| api Worker           |----->| D1 (inventory,       |  |
-|  | SPA + /api/*     |      | Hono, OpenAPI 3.1    |      | desired state, audit)|  |
-|  | Access JWT check |      | RBAC, idempotency    |      +----------------------+  |
-|  +------------------+      +----------+-----------+                               |
-|                                      |                                            |
-|                    +-----------------+-----------------+                          |
-|                    |                 |                 |                          |
-|                    v                 v                 v                          |
-|          +------------------+  +-------------+  +------------------+              |
-|          | DO per machine   |  | Queues      |  | Workflows        |              |
-|          | lease, fencing,  |  | commands,   |  | enroll, upgrade, |              |
-|          | live events      |  | events      |  | decommission     |              |
-|          +--------+---------+  +-------------+  +------------------+              |
-|                   |                                                                |
-|                   | Workers VPC binding: cf1:network                                |
-|                   v                                                                |
-|          +------------------+        +------------------------------+              |
-|          | Cloudflare       |        | R2 (artifacts, logs,         |              |
-|          | Tunnel per host  |        | snapshots, backups)          |              |
-|          +--------+---------+        +------------------------------+              |
-+-------------------|----------------------------------------------------------------+
-                    | outbound QUIC 7844
-                    v
-+-------------------|------------------------- Machine / site ------------------------+
-|  cloudflared (one per machine)                                                    |
-|      |                                                                            |
-|      v                                                                            |
-|  +------------------+     +---------------------------------------------------+    |
-|  | host agent        |---->| local runtimes                                    |    |
-|  | reconciler        |     |  Incus: containers and VMs                        |    |
-|  | local SQLite      |     |  containerd: OCI containers                       |    |
-|  | drivers           |     |  Firecracker / bhatti / hyper: sandboxes          |    |
-|  | metrics, logs     |     |  open-compute / workerd: Workers and DO           |    |
-|  +------------------+     |  celld / Rivet: distributed actors                |    |
-|                           |  SeaweedFS / RustFS: S3                           |    |
-|                           |  Woodpecker / Fireactions: CI runners             |    |
-|                           +---------------------------------------------------+    |
-|                                                                                    |
-|  local state: SQLite, images, snapshots, logs, S3 data                            |
-+------------------------------------------------------------------------------------+
++---------------------------- Cloudflare account ----------------------------+
+|                                                                           |
+|  Browser --HTTPS/Access--> console Worker --service--> api Worker        |
+|                                  |            |            |              |
+|                                  v            v            v              |
+|                                 D1           R2          Queues           |
+|                                  |                                       |
+|                     +------------+------------+                          |
+|                     | coordinator DO per machine |                        |
+|                     | lease, fencing, live state |                        |
+|                     +------------+------------+                          |
+|                                  |                                       |
+|                     +------------v------------+                          |
+|                     | relay DO per machine    |                          |
+|                     | WSS termination, mux    |                          |
+|                     +------------+------------+                          |
++----------------------------------|----------------------------------------+
+                                   | outbound wss:// 443
+                                   v
++------------------------------ Node ---------------------------------------+
+|  cfbd (single Rust binary, unprivileged)                                  |
+|    transport: relay client / optional native tunnel                       |
+|    router: host/path -> stream -> local Unix socket                       |
+|    supervisor: workerd, podman, incus, firecracker, runner                |
+|    storage: S3 gateway over local FS or upstream S3                      |
+|    state: SQLite (desired, observed, leases, events)                      |
+|    metrics: Prometheus text and pushed samples                            |
+|         |                                                                 |
+|         +--> workerd (V8, Unix socket)                                    |
+|         +--> rootless Podman (OCI)                                        |
+|         +--> Incus / Firecracker (privileged profile only)                |
++---------------------------------------------------------------------------+
 ```
 
-### 5.2 Planes and trust boundaries
+### 3.2 Planes and trust
 
-| Plane | Trust boundary | Authority | Failure behavior |
+| Plane | Trust | Authority | Failure |
 | --- | --- | --- | --- |
-| Browser | Untrusted | None; holds an Access session | Dashboard unavailable |
-| Control plane | Cloudflare account, operator-controlled | Inventory, desired state, policy, audit | Data plane continues; writes queue or fail |
-| Transport | Cloudflare Tunnel and VPC | Route and identity | Private control path lost; public ingress may continue if the tunnel is up |
-| Machine | Operator-owned hardware | Local execution state | Workloads continue; control plane marks machine offline |
-| Tenant workload | Untrusted or semi-trusted | None over the host | Isolated by VM or container; cannot reach the agent |
+| Browser | Untrusted | Access session | Dashboard unavailable |
+| Control plane | Cloudflare account, operator-controlled | Inventory, desired state, policy, audit | Nodes keep running; writes queue or fail |
+| Relay | Cloudflare, trusted for transport | Stream routing | Ingress and control path lost |
+| Node | Operator-owned | Observed state, local execution | Workloads continue |
+| Workload | Untrusted or semi-trusted | None over the host | Isolated by workerd, container or VM |
 
-The critical trust rule: **a tenant workload must never be able to reach the host
-agent, the local SQLite state, the cloudflared token, the machine identity key,
-or another tenant's runtime.** That is a design requirement, not a hardening
-task.
+A workload must never reach `cfbd`'s Unix socket, its identity key, its SQLite
+state, another tenant's runtime, or the host metadata address.
 
-### 5.3 Request flows
-
-**Create a container**
-
-1. Browser sends `POST /api/v1/workloads` with an `Idempotency-Key`.
-2. API validates the tenant, quota, image signature and placement labels.
-3. API writes the workload row in D1 with `generation=1` and `desired=running`.
-4. API asks the candidate machine's DO to reserve capacity and issue a lease.
-5. DO increments `lease_epoch` and returns a signed reservation.
-6. API writes the reservation and enqueues `reconcile` with the workload id and
-   generation.
-7. The agent receives the command over VPC, checks the lease epoch, pulls the
-   image, creates the Incus instance, starts it, and reports observed state.
-8. The DO updates the live state and fans out an event to the SPA. D1 is updated
-   asynchronously from the event, not as a second primary.
-9. The API returns `202` with an operation id. The SPA follows the operation over
-   SSE.
-
-**Run a CI job**
-
-1. A Git provider webhook hits `POST /api/v1/ci/hooks/{provider}`.
-2. API verifies the webhook signature, maps the repo to a tenant and a pool.
-3. API creates a job row and asks the pool's DO for a runner slot.
-4. The agent starts an ephemeral Incus container or Firecracker VM from a warm
-   image, injects a short-lived job token, mounts a cache volume, and starts the
-   runner.
-5. Logs stream to the agent, then to R2 in chunks; the SPA tails them over SSE.
-6. Artifacts are written to local S3; a manifest is written to D1.
-7. On exit, the agent destroys the runner, uploads the final log, and reports the
-   result. The control plane stores the job's secrets envelope-encrypted and
-   never holds them in plaintext.
+### 3.3 Request flows
 
 **Deploy a Worker**
 
-1. CI builds a bundle and uploads it to R2 with a content hash and a signature.
-2. API creates a deployment row and enqueues `deploy` to the target machine.
-3. The agent verifies the signature and hash, writes the bundle to
-   `/var/lib/cfb/bundles/<sha256>`, and calls the open-compute API or swaps a
-   workerd config symlink.
-4. The agent runs a health check against the local route.
-5. On success, the route pointer moves atomically. On failure, the previous
-   pointer stays.
+1. CI uploads the bundle and config to the control plane.
+2. The API records a deployment and enqueues `apply` to the target node.
+3. The relay opens an `apply` stream to `cfbd`.
+4. `cfbd` verifies the signature, generates the shim and workerd config, writes a
+   new version directory, and starts workerd on a new Unix socket.
+5. A smoke request succeeds; `cfbd` swaps the route pointer and reports observed
+   state.
+
+**Read an object**
+
+1. A Worker calls `env.BUCKET.get(key)`.
+2. The generated shim calls the node's S3 gateway over the local Unix socket.
+3. The gateway reads the local filesystem or proxies to the upstream S3.
+4. The response streams back through the shim. No Cloudflare R2 request is made
+   unless the object is configured as an R2 replica.
+
+**Start a container**
+
+1. The API writes a workload row and asks the coordinator DO for a lease.
+2. The relay opens a `reconcile` stream to `cfbd`.
+3. `cfbd` checks the lease epoch, calls the rootless Podman API over its Unix
+   socket, and starts the OCI image.
+4. `cfbd` reports observed state and streams logs.
+
+**Exec into a workload**
+
+1. The SPA opens a WebSocket to the API.
+2. The API authorizes the actor and asks the relay to open an `exec` stream.
+3. The relay and `cfbd` carry framed stdin/stdout/stderr with credit-based flow
+   control. The node never opens an inbound connection.
+
+## 4. Broker
+
+### 4.1 Single binary
+
+`cfbd` is one statically linked Rust binary. It is the only CFB process on the
+node. It does not embed a container runtime, a hypervisor or a V8 engine; it
+supervises those as child processes because they are separate security and
+failure domains.
+
+Compile-time features:
+
+| Feature | Contents | Profile |
+| --- | --- | --- |
+| `core` | transport, router, supervisor, SQLite state, metrics | all |
+| `workerd` | workerd config generation and supervision | standard, lite |
+| `oci` | rootless Podman/Docker client over Unix socket | standard |
+| `incus` | Incus client, VM and container driver | privileged |
+| `firecracker` | Firecracker API, jailer integration | privileged |
+| `s3` | local S3 gateway and upstream S3 client | standard, lite |
+| `ci` | runner supervision and log streaming | standard, privileged |
+| `tun` | native Cloudflare Tunnel QUIC/HTTP2 client | standard, privileged |
+
+A `lite` build excludes `oci`, `incus`, `firecracker`, `ci` and `tun`. The binary
+still contains the relay client, router, workerd supervisor, S3 gateway, state
+and metrics.
+
+### 4.2 Modules
+
+- **transport**: one outbound connection, reconnect with jitter, stream
+  multiplexing, heartbeat, signed handshake.
+- **router**: maps a stream's host and path to a local Unix socket or supervised
+  service; enforces per-route auth and body limits.
+- **supervisor**: starts, stops, restarts and health-checks children; captures
+  stdout/stderr with bounded buffers; applies rlimits and cgroups when delegated.
+- **workerd**: parses `wrangler.jsonc`, generates `workerd.capnp`, generates the
+  binding shim, manages version directories and atomic route swaps.
+- **oci**: talks to the rootless Podman or Docker socket; pulls by digest;
+  creates, starts, stops, removes containers; streams logs and exec.
+- **s3**: implements the S3 subset over a local filesystem or proxies to an
+  upstream S3 endpoint; verifies presigned URLs.
+- **state**: SQLite in WAL mode for desired specs, observed state, leases,
+  operations, event queue and local metrics buffer.
+- **metrics**: Prometheus text endpoint on the Unix socket and a pushed sample
+  to the control plane.
+- **admin**: local CLI over the Unix socket: status, logs, drain, upgrade,
+  rotate-key, diagnose.
+
+### 4.3 Process and privileges
+
+- Runs as a dedicated user, `cfb`, or as the invoking user in `lite` mode.
+- No setuid bit. No ambient capabilities by default.
+- The systemd unit uses `NoNewPrivileges=yes`, `ProtectSystem=strict`,
+  `ProtectHome=yes`, `PrivateTmp=yes`, `RestrictAddressFamilies=AF_UNIX
+  AF_INET AF_INET6`, and a read-write path only for the data directory.
+- `standard` may use the user's rootless Podman socket at
+  `$XDG_RUNTIME_DIR/podman/podman.sock`.
+- `privileged` may use a separate, optional helper for Incus, KVM, network
+  namespaces and mounts. The helper is not installed by default and is not part
+  of the `cfbd` binary. `cfbd` talks to it over a narrow local API, never a shell.
+- `lite` uses no helper and no root-owned socket.
+
+### 4.4 Local API
+
+- Default socket: `/run/cfb/cfbd.sock` for a system service, or
+  `$XDG_RUNTIME_DIR/cfb/cfbd.sock` for a user service.
+- Mode 0660, group `cfb-admin`; peer credentials checked with `SO_PEERCRED`.
+- HTTP/1.1 over the Unix socket, with JSON and streamed bodies. This keeps the
+  API debuggable with standard tools and avoids a custom RPC.
+- No TCP listener by default. `standard` may bind a child runtime to loopback
+  when the runtime cannot use a Unix socket. It never binds `0.0.0.0` or `::`.
+- `lite` and `strict` allow no TCP listener at all. Workerd receives an inherited
+  Unix socket with `--socket-fd`.
+
+### 4.5 Capabilities
+
+`cfbd` reports capabilities at enrollment and on every heartbeat:
+
+```
+workerd, do_sqlite, oci_rootless, oci_root, kvm, s3_local, s3_remote,
+ci_github, ci_woodpecker, tun, fuse, cgroup_v2, user_ns, tcp_loopback,
+unix_socket, tpm
+```
+
+The control plane stores the set and schedules only workloads whose required
+capabilities are present. A capability is owned by the node, not granted by the
+control plane. This follows the ServerBee model: the endpoint is the authority
+on what it can actually do.
+
+### 4.6 Local state
+
+- `/var/lib/cfb/state.db` or `$XDG_DATA_HOME/cfb/state.db`: SQLite, WAL.
+- `/var/lib/cfb/versions/<sha256>/`: immutable Worker bundles and configs.
+- `/var/lib/cfb/workloads/<id>/`: container and VM metadata.
+- `/var/lib/cfb/objects/<bucket>/<key>`: local S3 objects when `s3_local` is on.
+- `/var/lib/cfb/logs/<workload>/<run>`: bounded log segments.
+- `/etc/cfb/cfbd.toml` or `$XDG_CONFIG_HOME/cfb/cfbd.toml`: non-secret config.
+- `/etc/cfb/identity/` or `$XDG_STATE_HOME/cfb/identity/`: machine key and
+  credential, mode 0600.
+
+### 4.7 Resource envelope
+
+Design targets, not measured results:
+
+| Metric | Target |
+| --- | --- |
+| Static binary, `lite` | under 20 MiB |
+| Static binary, `standard` | under 30 MiB |
+| Idle RSS, `lite` | under 30 MiB |
+| Idle RSS, `standard` | under 60 MiB |
+| Idle CPU | under 1% of one core |
+| Reconnect after network loss | under 10 s, with jitter |
+| Local control API latency | under 20 ms p95 |
+
+The broker must stay below these targets on a 512 MB, 1 vCPU VPS. Measure before
+publishing.
+
+## 5. Transport
+
+### 5.1 Relay default
+
+The default transport is a single outbound WebSocket from `cfbd` to
+`wss://relay.<domain>/agent`. The Worker upgrades the request to a per-machine
+Durable Object. The DO holds the socket with the hibernation API and opens
+streams to the node.
+
+Why this is the default:
+
+- Works through any network that allows HTTPS on 443. No UDP 7844, no
+  `cloudflared`, no inbound firewall rule.
+- Runs without root, TUN or network namespaces.
+- One connection per node, not one per workload.
+- The same code path serves control commands, logs, exec and public ingress.
+- The relay is a Cloudflare primitive, so the control plane stays on Cloudflare.
+
+Costs and limits:
+
+- Incoming WebSocket messages are billed at a 20:1 ratio, outgoing messages and
+  protocol pings are free, and one request creates the connection. Control
+  traffic is cheap; sustained bulk traffic still costs more than a native tunnel
+  because of the extra hop.
+- A relay DO is a per-machine failure domain. If it is unavailable, that node's
+  control and ingress path is unavailable.
+- The Worker and DO must enforce frame size, stream count and backpressure.
+
+High-throughput data paths should use the native tunnel or direct S3, not the
+relay.
+
+### 5.2 Native tunnel, optional
+
+For nodes that can reach UDP 7844 or TCP 7844, `cfbd` may speak the Cloudflare
+Tunnel protocol directly. This removes the relay DO from the data path and
+matches `cloudflared` behaviour.
+
+The implementation builds on `talaria0101/cfrs` (0BSD): edge discovery, QUIC and
+HTTP/2 transport, header serialization, and the rootless Unix-socket origin.
+`cfrs` does not implement tunnel registration or visitor serving; CFB must add
+those. Until that exists, the native tunnel is a research track, not the default.
+
+Workers VPC is a third option. It lets a Worker reach a tunnel route without a
+relay DO. It is beta, account-wide when bound to `cf1:network`, and not required
+by this design. The relay is the portable path; VPC is an optimization.
+
+### 5.3 Framing and multiplexing
+
+One WebSocket carries many logical streams. Frames are binary, not base64 JSON:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 1 | version, `1` |
+| 1 | 4 | stream id, big-endian u32 |
+| 5 | 1 | type: `open`, `data`, `credit`, `half_close`, `reset`, `ping` |
+| 6 | 1 | flags |
+| 7 | 4 | payload length, big-endian u32 |
+| 11 | n | payload |
+
+- The control plane opens streams. The node never sends `open`; this prevents a
+  compromised node from creating arbitrary server-side streams.
+- Each stream has a bounded queue. A slow stream cannot starve another. Cap each
+  queue at 16 KiB, following mirrord's protocol-io design.
+- Credit-based flow control per stream, in bytes. The receiver grants credit;
+  the sender stops at zero.
+- Half-close is explicit. A request body and a response body may use the same
+  stream, as cfrs does for its Unix-socket origin.
+- Ping every 20 s; a missed pong after 60 s closes the socket and triggers
+  reconnect.
+- Maximum frame 64 KiB. Larger payloads are chunked.
+
+### 5.4 Identity and enrollment
+
+- The operator creates a machine and gets a one-time join token, valid for 15
+  minutes and bound to the machine id.
+- `cfbd` generates an Ed25519 key pair locally. The private key never leaves the
+  node.
+- `POST /v1/enroll` with the join token and public key. The control plane records
+  the key and issues a signed machine credential valid for 24 hours.
+- The credential binds machine id, key id and expiry. The lease epoch travels in
+  each signed request.
+- The node renews by signing the renewal request with its current key.
+- Revocation is checked on every request and renewal.
+- Every envelope is signed. TLS terminates at Cloudflare, so the signature is
+  the end-to-end authentication. No mTLS is used on either Cloudflare path.
+
+### 5.5 Constrained profiles
+
+| Profile | Root | Inbound TCP | Runtime | Transport | Use |
+| --- | --- | --- | --- | --- | --- |
+| `standard` | No | Loopback only | workerd, rootless Podman | WSS relay, optional native tunnel | Normal VPS or home server |
+| `lite` | No | None | workerd, static files | WSS relay on 443 | 512 MB VPS, no root, no container runtime |
+| `strict` | No | None | workerd, static files | WSS relay on 443 | No TCP listener at all |
+| `privileged` | Optional helper | Loopback only | Incus, Firecracker, workerd, Podman | WSS relay or native tunnel | KVM, VMs, untrusted code |
+
+`lite` constraints:
+
+- No setuid, no capabilities, no TUN, no network namespace, no KVM, no FUSE.
+- No Docker or Podman socket. No container workloads.
+- Workerd runs as the user and receives a Unix socket.
+- Local state under the user's home or a writable data directory.
+- Resource limits use rlimits and workerd limits. Cgroup delegation is optional.
+- Only trusted code. Workerd is not a hardened sandbox; `lite` must not run
+  hostile tenants. Untrusted code requires `privileged` with a microVM.
+- Storage is a local directory with the embedded S3 gateway. Optional upstream
+  S3 over outbound HTTPS.
+
+`strict` adds:
+
+- No TCP listener, not even loopback. All local services use Unix sockets.
+- Static files and workerd only. No child that requires a TCP port.
+- Public ingress is the relay only.
+
+### 5.6 Public ingress
+
+- A route maps a hostname and optional path prefix to a local Unix socket or a
+  supervised service.
+- The relay opens a stream for each request. `cfbd` forwards it to the target.
+- Access protects private hostnames. Public hostnames get WAF, rate limits and a
+  body limit at Cloudflare.
+- TLS terminates at Cloudflare. The origin uses HTTP over a Unix socket. If the
+  local network is untrusted, the operator may terminate TLS in `cfbd` with a
+  Cloudflare Origin Certificate.
+- The SPA never talks to a node directly. It talks to the API; the API talks to
+  the relay; the relay talks to `cfbd`.
 
 ## 6. Control plane
 
-### 6.1 Cloudflare product choices
+### 6.1 Cloudflare products
 
-| Need | Product | Why | Constraint |
-| --- | --- | --- | --- |
-| SPA and API | Workers static assets + Hono | One deploy, one origin, free static requests | Worker invocations are billed; keep navigation off the Worker |
-| Relational metadata | D1 | SQL, batch transactions, cheap | 10 GB per database, no interactive transactions, single primary |
-| Object store | R2 | Cheap, no egress fees, strong read-after-write | 5 TiB per object, 1 write/s per key |
-| Per-machine coordination | Durable Objects (SQLite) | Single writer, alarms, WebSocket fanout | 10 GB per object, soft 1,000 req/s per object |
-| Command fanout | Queues | Decoupling, retries, DLQ | At-least-once, unordered |
-| Long-running sagas | Workflows | Durable steps, sleeps, retries | Steps must be idempotent; 10,000 steps default, up to 25,000 |
-| Human auth | Access | OIDC, policy, audit | 500 apps, 50 service tokens per account |
-| Private transport | Tunnel + Workers VPC | Outbound-only, account-scoped | VPC is beta; 1,000 tunnels free, then $4.50 each |
-| Scheduled jobs | Cron + DO alarms | Coarse dispatch plus per-resource timers | Cron resolution 1 minute; one alarm per DO |
-| Observability | Workers Logs, Analytics Engine, Logpush | Native | Not a full APM; export to the data plane if needed |
+| Need | Product | Constraint |
+| --- | --- | --- |
+| SPA and API | Workers static assets and Hono | Worker invocations are billed |
+| Relational metadata | D1 | 10 GB per database, single primary |
+| Object store | R2 | 5 TiB per object, 1 write/s per key |
+| Per-machine lease | Durable Objects with SQLite | 10 GB per object, soft 1,000 req/s |
+| Relay | Durable Object with WebSocket hibernation | Messages count as requests |
+| Command fanout | Queues | At-least-once, unordered |
+| Long-running operations | Workflows | Idempotent steps, 25,000 step maximum |
+| Human auth | Access | 500 apps, 50 service tokens |
+| Optional direct path | Workers VPC | Beta, account-scoped |
 
 ### 6.2 Modules
 
 **`console` Worker**
 
-- Serves the Vite SPA from static assets with SPA fallback.
-- Serves `/api/*` from the same origin. This avoids CORS and keeps the Access
-  cookie on one origin.
-- Validates `Cf-Access-Jwt-Assertion` on `/api/*` against the team JWKS, checking
-  issuer and audience. Static asset requests do not invoke the Worker; Access
-  authorizes them at the edge. It does not trust `ctx.access` across service
-  bindings because the documentation says the context does not survive them.
-- Applies CSP, HSTS, frame denial, CSRF tokens for state-changing browser calls,
-  and per-user rate limits.
-- Holds no domain logic beyond auth and request shaping.
+- Serves the SPA from static assets with SPA fallback.
+- Serves `/api/*` on the same origin to avoid CORS and keep the Access cookie.
+- Validates `Cf-Access-Jwt-Assertion` on `/api/*` against the team JWKS, with
+  issuer and audience checks.
+- Applies CSP, HSTS, frame denial, CSRF tokens and per-user rate limits.
 
 **`api` Worker**
 
 - Owns the REST API, OpenAPI 3.1 document and domain services.
-- Writes D1 mutations and their audit rows in one `batch()` so the mutation and
-  the audit record commit together.
-- Uses `Idempotency-Key` for POST, `If-Match`/`generation` for optimistic
-  concurrency, and RFC 9457 `application/problem+json` for errors.
-- Emits an outbox row in the same batch as each state change. A queue consumer
-  publishes the event. This avoids a dual write between D1 and Queues.
-- Never calls a machine directly for a long operation. It enqueues a command and
-  returns `202` with an operation id.
+- Writes mutations and audit rows in one D1 `batch()`.
+- Uses `Idempotency-Key`, `ETag`/`If-Match`, and RFC 9457 errors.
+- Writes an outbox row in the same batch as each state change. A queue consumer
+  publishes it. No dual write.
+- Never calls a node directly for a long operation. It enqueues a command and
+  returns `202`.
 
 **`signer` Worker**
 
-- Holds the per-tenant storage credentials in Secrets Store.
-- Mints short-lived presigned URLs after an authorization check from the API.
-- Never returns a credential to the API, the SPA or a tenant.
-- Has no public route; it is reachable only through a service binding.
+- Holds per-tenant storage credentials in Secrets Store.
+- Mints short-lived presigned URLs after an authorization check.
+- Has no public route; reachable only through a service binding.
 - Records every mint in the audit chain.
 
-**`coordinator` Durable Object (one per machine)**
+**`coordinator` Durable Object, one per machine**
 
-- Holds `machine_id`, `lease_epoch`, `agent_key_id`, `last_seen`,
-  `desired_digest`, `observed_digest`, `pending_commands` and live subscribers.
-- Serializes reservations and command delivery for that machine.
-- Rejects a command whose `lease_epoch` is older than the current epoch.
-- Runs a lease alarm. If no heartbeat arrives before expiry, it marks the machine
-  offline and emits an event.
-- Fans out state changes to the SPA over WebSocket using the hibernation API.
+- Holds `machine_id`, `lease_epoch`, `key_id`, `last_seen`, desired and observed
+  digests, pending commands and live subscribers.
+- Serializes reservations and command delivery for one machine.
+- Rejects a command with an older `lease_epoch`.
+- Runs a lease alarm and marks the machine offline after four missed heartbeats.
+- Fans out state to the SPA over a hibernating WebSocket.
 
-**`relay` Durable Object (fallback transport)**
+**`relay` Durable Object, one per machine**
 
-- Accepts an outbound WebSocket from an agent when Workers VPC is unavailable or
-  unsuitable.
-- Authenticates the machine's signed handshake against its pinned public key,
-  maps the connection to a machine id, and routes control-plane requests over
-  the socket.
-- Uses credit-based flow control for log and exec streams. The agent never sends
-  `OPEN`; the relay opens streams. This prevents a compromised agent from
-  initiating arbitrary streams.
-- Is not the default path. It exists so the design does not depend on a beta VPC
-  feature.
+- Accepts the outbound WebSocket from `cfbd`.
+- Verifies the signed hello and maps the socket to a machine id.
+- Opens streams for control requests, logs, exec and ingress.
+- Enforces per-stream credit, frame size and stream count.
+- Never accepts an `open` frame from the node.
 
 **`provisioner` Workflow**
 
-- `enroll_machine`: validate the one-time join token, create the machine row,
-  create a tunnel, fetch the tunnel token, render the install command, wait for
-  the first heartbeat.
-- `join_site`: add the machine to an Incus cluster or a site pool, apply labels,
-  run a smoke test.
-- `upgrade_agent`: drain, download the signed agent, verify, restart, health
-  check, roll back on failure.
-- `decommission`: drain, migrate or stop workloads, delete the tunnel, revoke the
-  machine credential and key, delete local keys, mark deleted.
-- Every step is idempotent and keyed by the operation id.
+- `enroll_machine`: validate join token, create machine row, render install
+  command, wait for first heartbeat.
+- `upgrade_broker`: drain, verify signed binary, restart, health check, roll back.
+- `decommission`: drain, stop workloads, revoke credential and key, delete local
+  keys, mark deleted.
+- Every step is idempotent and keyed by operation id.
 
 **`janitor` Cron**
 
-- Expires stale leases and operations.
+- Expires leases, operations and stale relay sockets.
 - Deletes expired snapshots and orphaned R2 objects.
-- Rotates tunnel tokens and agent credentials before expiry.
-- Detects drift between desired and observed state and re-enqueues reconcile.
-- Enforces quotas and emits usage summaries.
+- Rotates credentials before expiry.
+- Re-enqueues drift between desired and observed state.
+- Emits usage summaries.
 
 **`notifier`**
 
-- Sends alerts to email, Discord or Slack. Alert content is rendered from D1 and
-  never includes secrets.
+- Sends alerts to email, Discord or Slack. Content is rendered from D1 and never
+  includes secrets.
 
-### 6.3 State ownership and consistency
+### 6.3 State ownership
 
 | Fact | Primary | Projection | Consistency |
 | --- | --- | --- | --- |
-| Tenant, user, role | D1 | SPA cache | Read-after-write with `first-primary` session |
-| Machine inventory | D1 | DO, SPA | Eventual; DO is live, D1 is durable |
-| Lease and fencing epoch | DO per machine | D1 audit | Strong within one object |
-| Desired workload spec | D1 | Agent local SQLite | Eventual; generation makes it idempotent |
-| Observed workload state | Agent local SQLite | DO, then D1 | Eventual; last writer wins with generation |
-| Object bytes | Local S3 | R2 replica | Async, checksum-verified |
-| Audit log | D1 hash chain | R2 WORM export | Append-only; verified on export |
-| Job logs | Local disk then R2 | D1 index | Chunked, checksummed |
-| Metrics | Agent buffer | DO aggregate, then D1/R2 | Sampled; not a billing source |
+| Tenant, user, role | D1 | SPA cache | Read-after-write |
+| Machine inventory | D1 | Coordinator DO, SPA | Eventual |
+| Lease and fencing epoch | Coordinator DO | D1 audit | Strong in one object |
+| Desired workload spec | D1 | Node SQLite | Eventual; generation idempotent |
+| Observed workload state | Node SQLite | Coordinator DO, D1 | Eventual; last writer with generation |
+| Object bytes | Node storage | R2 replica | Async, checksum-verified |
+| Audit log | D1 hash chain | R2 WORM export | Append-only |
+| Job logs | Node disk, then R2 | D1 index | Chunked, checksummed |
+| Metrics | Node buffer | DO aggregate, D1/R2 | Sampled; not billing |
 
 Rules:
 
-- D1 is not a message queue. Every state change also writes an outbox row.
-- A DO is not a database for inventory. It holds only the per-machine hot state
-  and a bounded command queue.
-- R2 is not a mutable state store. Objects are immutable and content-addressed;
-  the pointer lives in D1.
-- The agent's local SQLite is authoritative for what is actually running. The
-  control plane must reconcile to it, not overwrite it blindly.
+- D1 is not a queue. Every state change writes an outbox row.
+- A DO is not inventory. It holds hot state and a bounded command queue.
+- R2 is not mutable state. Objects are immutable and content-addressed.
+- The node's SQLite is authoritative for what is running. The control plane
+  reconciles to it; it does not overwrite it blindly.
 
 ### 6.4 Dashboard
 
-- Vite + React or Svelte SPA, built to static assets. No SSR, so page views do
-  not invoke the Worker.
+- Vite and React or Svelte, built to static assets. No SSR.
 - Views: overview, sites, machines, workloads, storage, CI, routes, operations,
   audit, usage, settings.
-- Live updates over a single WebSocket to the coordinator or an SSE stream from
-  the API. The SPA reconnects with a cursor.
-- Destructive actions require typing the resource name and, for production
-  resources, a second approver. The approval is a Workflow step, not a UI flag.
-- Every list view has a "why is this here" panel showing the desired state,
-  observed state, last reconcile, lease epoch and recent events.
-- The dashboard is an operator tool, not a tenant portal, in v1. A tenant portal
-  can be added later with the same API and narrower scopes.
+- Topology graph with live status, following homelable's node/edge model and
+  WebSocket status envelope.
+- Server and application cards with current state plus history, following
+  CoreObs's model. Do not copy its database-credential agent.
+- Host inventory from a one-shot probe, following omnyssh's sectioned command
+  output. Do not store plaintext passwords.
+- Live updates over one WebSocket with a cursor. Reconnect on gap.
+- Destructive actions require typing the resource name; production actions need
+  a second approver. The approval is a Workflow step.
+- Every resource has a "why is this here" panel: desired state, observed state,
+  last reconcile, lease epoch, recent events.
 
-### 6.5 Control-plane deployment
+### 6.5 Deployment
 
-- `wrangler versions upload` then `wrangler versions deploy`, tagged with the git
-  SHA. Promotion is a separate auditable action.
+- `wrangler versions upload`, then `wrangler versions deploy`, tagged with the
+  git SHA. Promotion is a separate auditable action.
 - D1 migrations are expand/contract and forward-only. A rollback restores code,
-  not data, so every migration must be compatible with the previous code.
-- Secrets are Workers secrets or Secrets Store bindings. They are never in D1,
-  R2, logs or the SPA.
-- The control plane is deployed to one Cloudflare account. Multi-account is a
-  later feature; the tunnel and VPC model is account-scoped.
+  not data.
+- Secrets are Workers secrets or Secrets Store bindings. Never in D1, R2, logs or
+  the SPA.
+- One Cloudflare account per control plane. Multi-account is out of scope.
 
-## 7. Data plane
+## 7. Execution backends
 
-### 7.1 Host agent
+### 7.1 Workers
 
-One static binary per machine, installed as a systemd service. It runs as an
-unprivileged user. A small privileged helper, or a set of specific sudo rules,
-handles only the operations that need root: network namespace setup, mounting
-volumes, creating Incus instances, and reading the machine identity key. The
-helper exposes a narrow local API, not a shell.
+`workerd` is the runtime for both Cloudflare and the node. The node generates a
+Cap'n Proto config from `wrangler.jsonc` and starts one workerd process per
+tenant or trust group. A generated shim maps R2, D1, KV and Queues to local
+services.
 
-Responsibilities:
+Two modes:
 
-- Enroll once with a one-time token, then authenticate with a machine key and a
-  short-lived credential.
-- Maintain an outbound connection through `cloudflared`; the agent listens only
-  on loopback.
-- Reconcile desired state from a local SQLite cache and the control plane.
-- Drive local runtimes through driver interfaces.
-- Report heartbeats, observed state, events, metrics and logs.
-- Enforce local policy: resource limits, network rules, image signature checks.
-- Survive control-plane outages and restart safely.
+- **direct**: workerd plus the generated shim. This is the default for
+  `standard` and `lite`. It covers the supported subset in section 2.3.
+- **open-compute**: supervise `ocd` when the application needs the broader
+  Workers API surface that open-compute implements. This adds a second binary
+  and is optional. open-compute is single-node and not HA.
 
-Local state:
+Raw workerd is not a hardened sandbox. Run it inside a VM or dedicated machine
+for untrusted code. `lite` runs trusted code only.
 
-- `/var/lib/cfb/state.db`: SQLite with desired specs, observed state, operation
-  log, lease epoch, and a bounded event queue.
-- `/var/lib/cfb/bundles/<sha256>`: immutable Worker bundles.
-- `/var/lib/cfb/images/<sha256>`: image manifests and content-addressed layers.
-- `/var/lib/cfb/snapshots/<id>`: local snapshots, with a retention policy.
-- `/var/lib/cfb/logs/<workload>/<run>`: local log segments before upload.
-- `/etc/cfb/agent.toml`: non-secret configuration.
-- `/etc/cfb/identity/`: machine credential and key, mode 0600, preferably
-  backed by a TPM.
+### 7.2 Containers
 
-### 7.2 Runtimes and drivers
+Use rootless Podman by default, Docker if the operator already runs it, and Incus
+containers in `privileged`. The artifact is an OCI image, so the same image runs
+on Cloudflare Containers and on the node.
 
-| Driver | Runtime | Workload type | Notes |
-| --- | --- | --- | --- |
-| `incus` | Incus | container, vm | REST API over a local Unix socket; projects for tenant separation; clustering for a site |
-| `containerd` | containerd + runc | container | OCI-native; good for CI runners and simple services |
-| `firecracker` | Firecracker | sandbox | One microVM per sandbox; jailer; vsock; snapshot/restore |
-| `bhatti` | bhatti (libkrucible) | sandbox | Higher-level microVM orchestrator; Linux and macOS; pilot |
-| `open-compute` | open-compute (`ocd`) | worker, durable | Workers-compatible platform on one machine; SQLite and optional S3 |
-| `workerd` | workerd | worker | Raw runtime; needs a supervisor and bindings; run inside a VM |
-| `celld` | celld | durable | Distributed Durable Objects; one application per fleet; pre-1.0 |
-| `rivet` | Rivet | durable | Actor platform with its own control plane; alternative to celld |
-| `seaweedfs` | SeaweedFS | storage | S3, erasure coding, replication, IAM/STS |
-| `rustfs` | RustFS | storage | S3, erasure coding, site replication; younger |
-| `woodpecker` | Woodpecker agent | ci | Gitea/Forgejo-style pipelines; ephemeral runners |
-| `fireactions` | Fireactions | ci | GitHub Actions runners in Firecracker VMs |
+- Read-only root filesystem; writable volume for `/tmp` and app data.
+- No host mounts except an explicit volume.
+- One network namespace per workload; default-deny egress.
+- CPU and memory limits through cgroups v2 when delegated; rlimits otherwise.
+- Seccomp profile, no-new-privileges, non-root user inside the container.
+- Image signed and pinned by digest.
 
-Each driver implements the same small interface:
+Containers share the host kernel. They are not a boundary for hostile code.
 
-```
-type Driver interface {
-    Capabilities(ctx) (Capabilities, error)
-    Reconcile(ctx, desired Workload, lease Lease) (Observed, error)
-    Start(ctx, id) error
-    Stop(ctx, id, grace) error
-    Destroy(ctx, id) error
-    Snapshot(ctx, id) (SnapshotID, error)
-    Restore(ctx, id, snapshot) error
-    Exec(ctx, id, cmd) (Stream, error)
-    Logs(ctx, id, since) (Stream, error)
-    Stats(ctx, id) (Stats, error)
-}
-```
+### 7.3 MicroVMs
 
-The driver is responsible for mapping a portable workload spec to the runtime's
-native objects and for reporting drift. The control plane never knows an Incus
-container name or a Firecracker socket path.
+`privileged` only. Use Firecracker directly or Incus VMs. One VM per tenant or
+trust group; own kernel; virtio devices only; no PCI passthrough in v1.
+Snapshot and restore through the driver. A sandbox is an ephemeral microVM with
+a TTL and an idle timeout.
 
-### 7.3 Site model
+### 7.4 Storage
 
-A **site** is a trust and failure domain: a rack, a home, a colo cage, or a cloud
-region. A site has one network boundary, one storage policy, and one latency
-budget. Machines belong to exactly one site.
+The node exposes an S3 gateway over a local filesystem. The gateway implements a
+narrow subset: `HeadObject`, `GetObject`, `PutObject`, `DeleteObject`,
+`ListObjectsV2`, and multipart upload. It verifies presigned URLs minted by the
+control plane. For multi-node durability, the backend can be SeaweedFS or RustFS
+instead of the local filesystem; the S3 contract does not change.
 
-Within a site:
+R2 remains the offsite copy and the control-plane store. Tenant reads do not go
+through R2 unless the bucket is configured that way.
 
-- **Standalone mode**: each machine runs its own agent and runtimes. No cluster.
-  This is the default for home labs and small sites.
-- **Incus cluster mode**: three or more machines form an Incus cluster with a
-  distributed database. The agent talks to the local Incus daemon; the cluster
-  handles placement and migration. Use this for a rack with reliable networking.
-- **Kubernetes mode**: optional. If the site already runs k3s or Kubernetes, the
-  agent can use it as the container runtime, and Fireactions or Actions Runner
-  Controller can manage CI runners. This is an escape hatch, not the default.
+### 7.5 CI
 
-The control plane does not require a cluster. It works with standalone machines
-and treats a cluster as one placement target with multiple machines.
+CI is optional and not part of `lite`. The node supervises one of:
 
-### 7.4 Provisioning a machine
+- the official GitHub Actions runner, in a rootless container or as a user
+  process, for GitHub workflows;
+- a Woodpecker agent, for Gitea or Forgejo.
 
-1. Operator creates a machine record in the dashboard. The API returns a one-time
-   join token, a tunnel token and an install command.
-2. Operator boots the machine with a base image (Ubuntu, Debian, Talos, or a
-   custom image) and runs the install command. For bare metal, cloud-init or a
-   USB image can carry the same command.
-3. The installer creates the `cfb` user, installs `cloudflared` and the agent,
-   writes the tokens to systemd credentials, and starts both services.
-4. The agent enrolls: it presents the join token, proves possession of its key,
-   and receives a short-lived credential.
-5. The provisioner creates the tunnel route, waits for the first heartbeat, runs
-   a smoke test (create a network namespace, pull a tiny image, run `true`), and
-   marks the machine `ready`.
-6. The machine appears in the dashboard with its capabilities, labels and
-   capacity.
+The broker does not parse pipeline YAML. It starts the runner, injects a
+short-lived job token, streams logs and uploads artifacts. The workflow file is
+unchanged.
 
-For racks with BMCs, MAAS or Tinkerbell can automate step 2. For a home lab,
-cloud-init on a USB image is enough. Do not build a PXE stack for one machine.
+### 7.6 Driver interface
 
-## 8. Connectivity
-
-### 8.1 One tunnel per machine
-
-Each machine gets one remotely managed Cloudflare Tunnel:
-
-- Name: `cfb-<site>-<machine>`.
-- `config_src=cloudflare`.
-- A hostname route for the agent, for example
-  `machine-<id>.internal.<domain>`, and optional hostname routes for public
-  workloads.
-- A token delivered once to the machine, stored in a systemd credential, never
-  in a file readable by workloads.
-
-Why one tunnel per machine:
-
-- One revocable credential per machine.
-- One route set per machine.
-- A compromised machine can be cut off by deleting its tunnel and its
-  connections.
-- It fits the 1,000-tunnel free tier. Beyond that, Tunnels for Platforms costs
-  $4.50 per additional tunnel per month, and inactive tunnels count.
-
-Do not use one tunnel for the whole fleet. A single tunnel shared by machines
-makes revocation and blast-radius control much harder.
-
-### 8.2 Control path
-
-The control plane binds the account-wide network once:
-
-```jsonc
-{
-  "vpc_networks": [
-    { "binding": "FLEET", "network_id": "cf1:network" }
-  ]
-}
-```
-
-Then a Worker calls:
-
-```ts
-const res = await env.FLEET.fetch(
-  `https://machine-${id}.internal:9443/v1/reconcile`,
-  { method: "POST", body: JSON.stringify(command), headers: authHeaders }
-);
-```
-
-`cf1:network` is the Cloudflare Mesh binding. It reaches every Mesh node,
-subnet route and hostname route announced through Tunnel or Mesh in the account,
-and public Internet destinations through Gateway. It is account-wide, not
-scoped to one tunnel, and it requires at least one active Tunnel, Mesh node or
-WAN on-ramp in the account. Adding a machine does not require a Worker redeploy.
-That convenience is a deliberate blast-radius tradeoff: a Gateway policy denies
-public Internet destinations for Workers VPC traffic in this account, and all
-traffic is logged. Scope the policy to this binding if the Gateway model allows
-it; verify that in Phase 0.
-The narrower alternative is one `tunnel_id` binding per machine. It scopes reach
-to one tunnel, but each new machine needs a Worker configuration change. Use it
-for small or high-value fleets. Workers VPC is a beta feature and is free on all
-Workers plans as of 2026-10-29.
-
-If VPC is unavailable, a feature flag switches the transport to the relay:
-
-- The agent opens `wss://relay.<domain>/agent` and signs the handshake with its
-  machine key.
-- The relay DO verifies the signature against the pinned key, maps the
-  connection, and exposes the same request/response and stream semantics.
-- The agent initiates the connection; the control plane never dials the machine.
-
-The transport is behind a `PrivateTransport` interface. The rest of the system
-does not know which one is in use.
-
-### 8.3 Public ingress
-
-- A public workload gets a hostname route on the machine's tunnel.
-- The route points to a local address, for example `127.0.0.1:8080` or an Incus
-  instance's proxy address.
-- Access protects private applications. Public applications get WAF, rate limits
-  and a request-size limit.
-- TLS terminates at Cloudflare. The origin can use HTTP on loopback, or TLS with
-  a Cloudflare Origin Certificate if the local network is untrusted. On the
-  control path this means the Worker does not see a client certificate from the
-  agent; machine and control-plane authentication use the request signatures in
-  section 14.2.
-- The SPA never talks to a machine directly. It talks to the API; the API talks
-  to the agent; the agent talks to the runtime. This is the same-origin BFF
-  pattern and it keeps service tokens out of JavaScript.
-
-### 8.4 Human and service access
-
-- Humans authenticate through Access with an OIDC identity provider.
-- The Worker validates the Access JWT on every `/api/*` request. Static asset
-  requests are authorized by Access at the edge and do not invoke the Worker.
-  It does not trust a header alone.
-- Service-to-service automation uses scoped API tokens issued by the control
-  plane, not Access service tokens, except where a non-Worker client must cross
-  an Access application. Access service tokens are limited to 50 per account, so
-  they are not per-tenant.
-- SSH is not a control path. If an operator needs a shell, the dashboard opens
-  an audited exec session through the agent. For break-glass access, use Access
-  short-lived certificates or a Teleport-style proxy, and record the session.
-
-### 8.5 Egress
-
-- Each workload gets a network namespace and a default-deny egress policy.
-- Allowed destinations are configured per tenant: CIDRs, hostnames, or a proxy.
-- DNS goes through a local resolver that enforces the allowlist and logs queries.
-- A per-tenant egress proxy can inject credentials so that workload code never
-  holds the upstream token.
-- Egress volume is metered per tenant and reported in the dashboard.
-
-## 9. Orchestration
-
-### 9.1 What orchestrates what
-
-Cloudflare is transport, identity and metadata. It is not the scheduler.
-
-The scheduler is the **host agent plus the site runtime**. The control plane
-computes a candidate set and records the decision; the agent and the runtime
-make it real. This keeps the data plane independent and avoids a global
-consensus system.
-
-For a single site, Incus can make placement decisions within its cluster. For
-multiple standalone machines, the control plane computes a candidate set from
-labels, free capacity and locality, then asks the target machine's DO for a
-lease. If the machine cannot take the workload, the agent returns a structured
-failure and the control plane tries the next candidate.
-
-### 9.2 Desired state and generations
-
-Every workload has:
-
-- `spec`: the desired configuration.
-- `generation`: a monotonically increasing integer, incremented on every spec
-  change.
-- `observed`: the last state reported by the agent.
-- `observed_generation`: the generation that produced `observed`.
-- `lease_epoch`: the fencing token for the machine that owns the workload.
-
-The agent applies a spec only if `generation > observed_generation` and
-`lease_epoch >= local_epoch`. Applying the same generation twice is a no-op.
-This makes retries and duplicate queue deliveries safe.
-
-### 9.3 Leases and fencing
-
-A lease carries a monotonic fencing token and a separate liveness deadline:
+Each backend implements a small interface:
 
 ```
-lease = {
-  machine_id,
-  epoch,          // monotonic, incremented on every new owner
-  holder,         // agent instance id
-  liveness_expires_at,
-  signature
-}
+Capabilities() -> CapabilitySet
+Reconcile(desired Workload, lease Lease) -> Observed
+Start(id), Stop(id, grace), Destroy(id)
+Snapshot(id) -> SnapshotID, Restore(id, snapshot)
+Exec(id, argv) -> Stream, Logs(id, since) -> Stream
+Stats(id) -> Stats
 ```
 
-- The DO issues the lease and increments the epoch.
-- The agent includes the epoch in every mutation and heartbeat.
-- `epoch` is the fencing token. It never expires and is the only thing that
-  decides whether a mutation is stale.
-- `liveness_expires_at` is used by the control plane for placement and offline
-  detection. It is not an authorization deadline for the agent.
-- An agent that cannot reach the control plane keeps reconciling local desired
-  state with its last epoch. It refuses a command carrying a lower epoch. This
-  is what lets the data plane keep running through an outage longer than 60
-  seconds.
-- The DO rejects a stale epoch.
-- The local runtime is told the epoch; a volume or snapshot operation that
-  carries an older epoch is refused.
-- If an agent is reinstalled, the old credential and key are revoked and the
-  epoch is incremented. The old agent cannot act even if it still has a network
-  path.
+The driver maps a portable workload spec to native objects and reports drift.
+The control plane never knows a Podman container id or a Firecracker socket path.
 
-A lease is not a distributed lock across machines. It is a per-machine fencing
-token. Cross-machine operations, such as moving a volume, use a two-phase
-reservation: reserve on the destination, detach from the source, attach on the
-destination, then release the source.
+## 8. Orchestration
 
-### 9.4 Placement
+### 8.1 Placement
 
-Placement inputs:
+The control plane computes a candidate set from capabilities, labels, free
+capacity, volume locality, isolation level, anti-affinity and drain state. It
+asks the target machine's coordinator DO for a lease. The node makes the
+workload real. The control plane does not continuously rebalance; it moves
+workloads only on an explicit operation, drain or failed lease.
 
-- Workload class (container, vm, sandbox, worker, ci).
-- Required runtime and image architecture.
-- CPU, memory, disk and GPU requirements.
-- Volume locality and storage class.
-- Site, rack and network constraints.
-- Tenant isolation level (dedicated machine, dedicated VM, shared container).
-- Anti-affinity and spread rules.
-- Cost and power state.
+Preference order:
 
-Placement output is a machine id and a lease. The algorithm is deterministic for
-a given input and a given inventory snapshot, so a retry does not flap. It
-prefers:
+1. Node has the image in cache.
+2. Same site and rack as the volume.
+3. Lowest projected utilization.
+4. Not draining.
 
-1. A machine that already has the image and a warm cache.
-2. A machine in the same site and rack as the volume.
-3. A machine with the lowest projected utilization.
-4. A machine that is not draining.
+### 8.2 Generations and leases
 
-The control plane does not continuously rebalance. It rebalances only on an
-explicit operation, a machine drain, or a failed lease. Avoiding a global
-optimizer is deliberate: it is a source of instability and hard-to-debug
-movement.
+Every workload has `spec`, `generation`, `observed`, `observed_generation` and
+`lease_epoch`.
 
-### 9.5 Reconciliation loop
+- The node applies a spec only if `generation > observed_generation` and
+  `lease_epoch >= local_epoch`.
+- The same generation twice is a no-op.
+- The lease epoch is a monotonic fencing token. It does not expire.
+- `liveness_expires_at` is for placement and offline detection, not agent
+  authorization.
+- A node that cannot reach the control plane keeps reconciling its last desired
+  state and refuses a lower epoch.
+- Reinstalling a node revokes the old credential and key and increments the
+  epoch.
 
-The agent loop:
+### 8.3 Reconciliation
 
-1. Read local desired state and the last observed state.
-2. If the control plane is reachable, fetch a digest of desired state and any
-   new commands. If not, continue with the local cache.
-3. For each workload whose desired generation is ahead, validate the spec, check
-   the lease, and call the driver.
-4. Record an operation log entry before and after each external call.
-5. Report observed state and events. If the report fails, keep them in a bounded
-   queue and retry with exponential backoff and jitter.
-6. Sleep until the next heartbeat or an event.
+1. Read local desired and observed state.
+2. If the control plane is reachable, fetch a desired digest and commands. If
+   not, use the local cache.
+3. For each workload with a newer generation, validate, check the lease, call
+   the driver.
+4. Record an operation entry before and after each external call.
+5. Report observed state and events. On failure, keep a bounded queue and retry
+   with exponential backoff and jitter.
+6. Sleep until the next heartbeat or event.
 
-The loop is level-triggered, not edge-triggered. It does not depend on receiving
-every command. A lost command is recovered by the next digest comparison.
+The loop is level-triggered. A lost command is recovered by the next digest.
 
-### 9.6 Failure handling
+### 8.4 Failure handling
 
 | Failure | Detection | Response |
 | --- | --- | --- |
-| Control plane unavailable | Agent request timeout | Keep reconciling from local cache; queue events; dashboard unavailable |
-| Cloudflare Tunnel down | `cloudflared` metrics, VPC error | Agent retries; public ingress down; alert; no workload restart |
-| Machine offline | Lease expiry, missed heartbeats | Mark offline; do not delete workloads; alert; reschedule replicated workloads elsewhere |
-| Agent crash | systemd restart, missed heartbeat | Restart; reconcile from local SQLite; do not recreate healthy workloads |
-| Runtime crash | Driver health check | Restart the runtime; recreate only the affected workload |
-| Queue duplicate | Idempotency key, generation | No-op |
-| Split brain | Two agents claim the same machine | Credential and key revocation, epoch bump, tunnel deletion; the stale agent cannot act |
-| D1 write failure | API error | Return 503; retry with the same idempotency key; do not acknowledge |
-| DO unavailable | API error | Queue the command in D1 outbox; retry; the data plane is unaffected |
+| Control plane unavailable | Request timeout | Keep reconciling; queue events; dashboard unavailable |
+| Relay unavailable | WebSocket close | Reconnect with jitter; public ingress down; workloads keep running |
+| Node offline | Lease expiry, missed heartbeats | Mark offline; do not delete workloads; alert |
+| Broker crash | systemd restart | Restart; reconcile from SQLite; do not recreate healthy workloads |
+| Runtime crash | Health check | Restart the runtime; recreate only the affected workload |
+| Duplicate command | Idempotency key, generation | No-op |
+| Split brain | Two brokers claim a machine | Credential and key revocation, epoch bump, relay close |
+| D1 write failure | API error | 503; retry with the same idempotency key |
+| DO unavailable | API error | Queue command in D1 outbox; data plane unaffected |
 | R2 unavailable | Upload error | Buffer locally; retry; do not block workload start |
-| Storage disk failure | SMART, checksum, scrub | Mark the disk degraded; rebuild from EC or replica; alert |
-| Site network partition | Heartbeats, storage replication lag | Keep the site running; control plane sees stale state; do not auto-fail over stateful workloads |
+| Disk failure | SMART, checksum, scrub | Mark degraded; rebuild from replica; alert |
+| Site partition | Heartbeats, replication lag | Keep the site running; do not auto-fail over stateful workloads |
 
-## 10. Storage
+## 9. Storage
 
-### 10.1 Tiers
+### 9.1 Tiers
 
 | Tier | Backend | Use | Durability |
 | --- | --- | --- | --- |
-| Hot | Local NVMe + SeaweedFS or RustFS | Workload data, images, caches, CI artifacts | 3 replicas or EC 4+2 within the site |
-| Warm | R2 Standard | Offsite copy, control-plane artifacts, logs, snapshots | R2 durability claim, versioning |
+| Hot | Local NVMe plus S3 gateway | Workload data, images, caches, CI artifacts | Replicas or erasure coding within the site |
+| Warm | R2 Standard | Offsite copy, control-plane artifacts, logs, snapshots | R2 durability, versioning |
 | Cold | R2 Infrequent Access | Backups and old logs | 30-day minimum, retrieval fee |
 
-R2 is not the primary data path for tenant workloads. It is the offsite copy and
-the control-plane store. This keeps egress free for reads from Cloudflare and
-keeps tenant data local.
+### 9.2 Buckets and tenancy
 
-### 10.2 Why SeaweedFS first
-
-SeaweedFS is Apache-2.0, active, and covers the S3 surface plus IAM/STS, erasure
-coding, cross-cluster replication and an admin API. `weed mini` is documented as
-a single-node production path, which makes the first machine simple. It scales
-out by adding volume servers and stateless S3 gateways. The tradeoff is more
-moving parts than a single binary and a metadata store choice that matters.
-
-RustFS is the second choice: Apache-2.0, MinIO-compatible layout, erasure coding,
-site replication, IAM/OIDC and a console. It is younger and its own compatibility
-matrix is honest about gaps. Pilot it on a non-critical bucket before trusting a
-tenant.
-
-MinIO is not a choice for new deployments. The upstream repository is archived,
-and the licence is AGPL-3.0. Use it only as a compatibility reference.
-
-Garage is a good small geo-distributed store, but it does not aim for R2 parity:
-no versioning, no SSE, no object ACLs, and replication rather than erasure
-coding. Use it for a small home lab, not as a general R2 replacement.
-
-Ceph is the right answer only if you already operate Ceph. It is too heavy for a
-one-machine site.
-
-### 10.3 Buckets and tenancy
-
-- One bucket per tenant per site, or one bucket per tenant with a key prefix if
-  bucket count is a problem.
-- IAM policies per tenant. A dedicated `signer` Worker holds the per-tenant
-  storage credential and mints presigned URLs after an authorization check. The
-  API calls it over a service binding, so the API Worker does not hold the
-  storage credential.
-- Presigned URLs point at a dedicated S3 hostname route through the site's
-  tunnel, for example `s3-<site>.<domain>`. The S3 signature is the
-  authorization. Do not put an Access application in front of that hostname: a
-  presigned request carries no Access cookie or service token.
-- Server-side encryption with per-tenant keys. Keep the keys in the control
-  plane's secret store or a local KMS; never in object metadata.
-- Versioning on for backups and audit artifacts; lifecycle rules to R2 IA.
+- One bucket per tenant per site, or one bucket with a tenant prefix.
+- Per-tenant credentials; the `signer` Worker holds them and mints presigned
+  URLs after authorization.
+- Presigned URLs point at `s3-<site>.<domain>` through the relay. The S3
+  signature is the authorization; do not put Access in front of that hostname.
+- Server-side encryption with per-tenant keys. Keys live in the control plane's
+  secret store or a local KMS, never in object metadata.
+- Versioning for backups and audit artifacts; lifecycle rules to R2 IA.
 - Object lock or a WORM bucket for audit exports.
-- A `cfb-manifests` bucket holds content hashes, signatures and restore indexes.
 
-### 10.4 Replication and restore
+### 9.3 Replication and restore
 
-- A replication worker runs on each site. It walks new objects, verifies the
-  checksum, and uploads to R2 with the same key and metadata.
-- Replication lag is a metric. A alert fires when lag exceeds the RPO.
-- Restore is a documented, tested operation: pick a snapshot or a prefix,
-  restore to a new bucket, verify checksums, then cut over.
-- A monthly restore drill restores a random object and a random D1 export into a
-  scratch environment and compares hashes.
+- A replication worker on each site walks new objects, verifies the checksum and
+  uploads to R2 with the same key and metadata.
+- Replication lag is a metric. Alert when it exceeds the RPO.
+- Restore is tested: restore a snapshot or prefix to a new bucket, verify
+  checksums, then cut over.
+- A monthly drill restores a random object and a D1 export and compares hashes.
 
-### 10.5 Control-plane backups
+### 9.4 Control-plane backups
 
-- D1: daily export to R2, plus Time Travel for point-in-time recovery. The export
-  is encrypted and versioned.
-- DO: the authoritative per-machine state is reconstructible from D1 and the
-  agent's local SQLite. A daily snapshot is still taken for faster recovery.
+- D1: daily export to R2 plus Time Travel. Encrypted and versioned.
+- DO: reconstructible from D1 and node SQLite; daily snapshot for faster recovery.
 - R2: versioning and object lock on audit and backup prefixes.
-- Configuration: everything in Git (Terraform or Wrangler config), with secrets
-  in the secret store.
+- Configuration: Git, with secrets in the secret store.
 
 RPO and RTO:
 
 - Control-plane metadata: RPO 15 minutes, RTO 2 hours.
-- Tenant objects: RPO 15 minutes for the offsite copy, RTO 4 hours for a site
-  loss.
+- Tenant objects: RPO 15 minutes offsite, RTO 4 hours for a site loss.
 - Audit: RPO 5 minutes, immutable export.
 
-## 11. Compute classes
+## 10. Security summary
 
-### 11.1 Containers (trusted)
+The full threat model is in `docs/security.md`. Load-bearing controls:
 
-Use Incus containers or containerd. Default for long-running services, internal
-tools, and CI runners for trusted code.
+- Access JWT validation at the Worker with issuer and audience checks.
+- Signed machine envelopes, pinned keys, 24-hour credentials and revocation.
+- One outbound WebSocket and one identity per node. No inbound port, no SSH.
+- Default-deny egress per workload.
+- MicroVM isolation for untrusted code; containers for trusted code; workerd
+  only inside a VM or dedicated machine for hostile code.
+- Signed images and bundles, digest pinning, SBOM.
+- Plaintext secrets never in D1, R2, logs or the SPA.
+- Hash-chained audit with a WORM export.
+- Two-person approval for destructive operations.
 
-- Read-only root filesystem; a writable volume for `/tmp` and app data.
-- No host mounts except an explicit volume.
-- One network namespace per workload; default-deny egress.
-- CPU and memory cgroups; disk quota; PID limit.
-- Seccomp profile and no-new-privileges.
-- A non-root user inside the container.
-- Image must be signed and pinned by digest.
+## 11. Operations and SLOs
 
-Containers share the host kernel. They are not a boundary for hostile code. Use
-them only for code you trust at least as much as the host.
+### 11.1 Enrollment and upgrades
 
-### 11.2 Virtual machines (semi-trusted)
+- Enrollment is a Workflow with a visible checklist.
+- Broker upgrades are staged: one canary per site, then 10%, then the rest.
+- Binaries are signed and verified before execution. Keep the last two versions.
+- A failed health check rolls back.
 
-Use Incus VMs (QEMU/KVM) for a stronger boundary with a familiar API. Use
-Firecracker for a smaller device model and faster start.
+### 11.2 Observability
 
-- One VM per tenant or per trust group.
-- Own kernel; no shared kernel with the host.
-- Virtio devices only; no PCI passthrough in v1.
-- Cloud-init for first boot; Ignition optional.
-- Snapshot and restore through the driver.
-- Live migration only within an Incus cluster and only on shared storage.
+- OpenTelemetry in the broker and control plane.
+- Metrics: local Prometheus text on the Unix socket; pushed aggregates to the
+  control plane. Do not send raw samples to D1.
+- Logs: local files, uploaded to R2 in chunks; index in D1.
+- Traces: OTLP endpoint, adaptive sampling.
+- Alerts: lease expiry, node offline, disk > 85%, replication lag, credential
+  expiry, failed reconciles, queue depth, unusual egress, audit chain failure.
 
-### 11.3 Sandboxes (untrusted)
+### 11.3 SLOs
 
-Use Firecracker directly, or bhatti/hyper as an orchestrator. A sandbox is an
-ephemeral microVM for agent code, CI steps, or user-supplied code.
+| SLO | Target | Measurement |
+| --- | --- | --- |
+| Control-plane API availability | 99.9% monthly | Successful requests, excluding 4xx |
+| Dashboard availability | 99.9% monthly | Synthetic check from two regions |
+| Heartbeat freshness | 95% under 30 s | Broker and DO timestamps |
+| Container start, cached image | p95 under 10 s | Broker operation log |
+| Worker start, warm | p95 under 1 s | workerd log |
+| Sandbox start, warm pool | p95 under 1 s | Broker operation log |
+| New node provisioning | p95 under 10 min | Workflow timestamps |
+| Log delivery to R2 | p95 under 10 s | Chunk timestamp vs upload |
+| Control-plane metadata RPO | 15 min | Backup timestamps |
+| Tenant object offsite RPO | 15 min | Replication lag |
+| Audit export RPO | 5 min | Export cursor |
 
-API:
+These are targets, not measured results.
 
-```
-POST /v1/sandboxes                 create
-POST /v1/sandboxes/{id}/exec       exec, stream stdout/stderr
-GET  /v1/sandboxes/{id}/files      read a file
-PUT  /v1/sandboxes/{id}/files      write a file
-POST /v1/sandboxes/{id}/ports      expose a local port through the agent
-POST /v1/sandboxes/{id}/snapshot   snapshot the rootfs
-POST /v1/sandboxes/{id}/restore    restore a snapshot
-DELETE /v1/sandboxes/{id}          destroy
-```
+### 11.4 Capacity
 
-Properties:
+- Reserve 20% headroom per node for the broker, workerd, images and snapshots.
+- Cap containers by CPU and memory, not by count.
+- Keep a warm image cache for the top 10 images per site.
+- Track storage growth per tenant; alert at 70% and 85%.
+- On `lite`, reserve 128 MiB for the broker and workerd; reject workloads that
+  do not fit.
 
-- TTL and idle timeout. The default is 30 minutes; the maximum is configurable.
-- No host mounts. A shared volume is a virtio-fs or 9p mount with a narrow path,
-  or an S3 mount.
-- Egress through the workload proxy only.
-- Snapshot is rootfs only, like Cloudflare's Containers. Memory and processes do
-  not survive.
-- A warm pool per image to hide image pull and boot time.
-- One microVM per sandbox; do not multiplex tenants in one VM.
+### 11.5 Incident response
 
-Do not claim Cloudflare's 648 ms p50 or 100,000-container burst. Target 1 to 3
-seconds for a cold start and 200 to 500 ms from a warm pool, and measure it.
-
-### 11.4 Workers (stateless and durable)
-
-Use open-compute as the default per-machine Workers platform. It is one binary,
-runs workerd, and provides Workers, KV, D1, R2, DO, Queues, Workflows, Cron,
-Cache, Vectorize and AI Search on one machine with SQLite and optional S3. It has
-a dashboard and a `/client/v4` API, which makes it easy to drive from the agent.
-It is explicitly single-node and not HA, which is the right scope for one machine.
-
-Two deployment modes:
-
-- **open-compute mode**: install `ocd` inside an Incus VM, one VM per tenant or
-  trust group. Create one open-compute instance in that VM, deploy bundles
-  through `ocd cf deploy --prebuilt`, and expose routes through the tunnel. The
-  agent stores the deployment metadata and health. Do not run `ocd` directly on
-  the host when tenants are not mutually trusted: workerd is not a hardened
-  sandbox, and open-compute's own threat model says tenant egress can reach host
-  loopback and metadata addresses.
-- **raw workerd mode**: run `workerd serve` under systemd with `--socket-fd`,
-  generate a Cap'n Proto config, and supervise it yourself. Use this only if you
-  need a binding that open-compute does not support. Raw workerd is not a
-  hardened sandbox; run it inside a VM or a dedicated machine.
-
-Distributed Durable Objects:
-
-- **celld** is the closest thing to a distributed DO runtime on private hardware.
-  It uses an S3-compatible bucket for ownership records and conditional writes,
-  and runs Workers, DO, KV, D1, R2, Queues, Workflows and Cron from a
-  `wrangler.json`. It is pre-1.0 (v0.6.3), runs one application per fleet, has no
-  account service, and does not terminate TLS. Use it for one tenant per fleet,
-  or wait.
-- **workerd ClusterConfig** is a new experimental mode that distributes DOs
-  across workerd instances using leases in an S3 bucket. It requires
-  `--experimental` and a private network. Treat it as a research track, not a
-  production default.
-- **Rivet** is an actor platform, not a Workers runtime. It is a good fit for
-  per-session or per-agent actors with SQLite, queues, scheduling and hibernation.
-  It runs its own control plane. Use it only if the workload is actor-shaped, not
-  Worker-shaped.
-
-### 11.5 CI (heavy, long-running)
-
-Two supported shapes:
-
-**GitHub Actions: Fireactions**
-
-Fireactions runs GitHub runners in ephemeral Firecracker VMs, creates JIT runner
-tokens, scales pools on `workflow_job` events, and destroys the VM after the job.
-It is Apache-2.0 and BYOM. Use it when the repository is on GitHub and the job
-needs a real VM.
-
-**Gitea or Forgejo: Woodpecker**
-
-Woodpecker has an Apache-2.0 server and agent, a gRPC boundary, a Kubernetes
-backend and an autoscaler. Run the server on a machine (or behind the tunnel) and
-agents on the site. Use ephemeral Incus containers or Firecracker VMs per job.
-
-**What the control plane does**
-
-- Stores repository, pool, image, secret reference, concurrency and timeout
-  configuration.
-- Receives webhooks, verifies signatures, and creates a job row.
-- Asks the pool's DO for a slot and enqueues a start command.
-- Streams logs to R2 and artifacts to local S3.
-- Shows queue depth, wait time, run time, failures and cost per repo.
-- Does not run the job, hold the job's secrets, or parse the pipeline language.
-
-Heavy CI needs:
-
-- A warm image cache on each runner machine.
-- A shared cache bucket (S3) mounted or synced into the job.
-- CPU pinning or a dedicated runner machine for large builds.
-- A concurrency limit per tenant to avoid one repo starving the fleet.
-- A hard timeout and a disk quota.
-- Log chunking with backpressure; a chatty job must not fill the agent's memory.
-
-### 11.6 Computer-like workspace
-
-Cloudflare Computer is an early-preview library (`@cloudflare/computer` 0.8.0,
-MIT) that gives an agent a SQLite-backed workspace and switches between an
-isolate and a container. It is not a separate compute product. The CFB equivalent
-is a **workspace service**:
-
-- A durable filesystem per workspace, stored in local S3 or a volume.
-- Two execution backends: an open-compute/worker backend for fast file and code
-  operations, and a sandbox backend for Linux commands.
-- A sync daemon that keeps the two views consistent.
-- Tools for read, write, edit, bash, and port forwarding.
-- Every operation is audited and attributable to a workspace and an actor.
-
-This is a product layer on top of the sandbox and Worker primitives, not a new
-runtime.
+1. Revoke the machine credential and key; close the relay socket.
+2. Cordon the node; do not place new workloads.
+3. Snapshot local state and logs before rebuilding.
+4. Rotate any secret the node could reach.
+5. Rebuild from a known image; re-enroll with a new identity.
+6. Record timeline, root cause and the control that prevents recurrence.
 
 ## 12. Data model
 
-The following is a logical schema, not final DDL. All tables have `created_at`,
-`updated_at`, `created_by` and `generation` where mutation matters.
+Logical schema, not final DDL. Every mutable table has `created_at`,
+`updated_at`, `created_by` and `generation` where relevant.
 
 ```
 accounts(id, name, plan, created_at)
@@ -978,18 +890,19 @@ users(id, account_id, email, name, status)
 memberships(user_id, account_id, role, tenant_scope)
 tenants(id, account_id, name, isolation_level, quota_json)
 sites(id, account_id, name, region, network_cidr, storage_class)
-machines(id, site_id, name, hostname, labels_json, capacity_json,
-         status, tunnel_id, tunnel_name, agent_version, agent_fingerprint,
-         last_seen_at, drain_state, created_at)
+machines(id, site_id, name, hostname, profile, labels_json, capacity_json,
+         capabilities_json, status, transport, relay_id, broker_version,
+         key_id, last_seen_at, drain_state, created_at)
 runtimes(id, machine_id, kind, version, capabilities_json, status)
-workloads(id, tenant_id, site_id, machine_id, name, kind, image, command_json,
-          resources_json, volumes_json, network_json, placement_json,
-          desired_state, generation, observed_state, observed_generation,
-          lease_epoch, created_at)
+workloads(id, tenant_id, site_id, machine_id, name, kind, artifact,
+          config_json, resources_json, volumes_json, network_json,
+          placement_json, desired_state, generation, observed_state,
+          observed_generation, lease_epoch, created_at)
 volumes(id, tenant_id, site_id, machine_id, name, size_gb, storage_class,
         snapshot_id, attached_to, status)
 buckets(id, tenant_id, site_id, name, backend, replication_target, status)
-routes(id, tenant_id, machine_id, hostname, target, access_app_id, tls_mode)
+routes(id, tenant_id, machine_id, hostname, path_prefix, target, access_app_id,
+       tls_mode)
 jobs(id, tenant_id, provider, repo, ref, sha, pool_id, status, started_at,
      finished_at, exit_code, log_key, artifact_manifest_key)
 operations(id, tenant_id, kind, status, steps_json, requested_by, started_at,
@@ -1007,7 +920,7 @@ agents(id, machine_id, credential_id, public_key, token_hash, version,
        last_seen_at, revoked_at)
 ```
 
-Indexes that matter:
+Indexes:
 
 - `workloads(tenant_id, desired_state)`
 - `workloads(machine_id, observed_generation)`
@@ -1016,31 +929,27 @@ Indexes that matter:
 - `outbox(published_at)` partial index for unpublished rows
 - `jobs(tenant_id, status, created_at)`
 
-D1 size strategy: one database for the control plane until 5 GB, then shard by
-account or tenant group. Cross-shard reporting goes through R2 exports, not
-cross-database joins. The 10 GB per-database limit cannot be raised.
+D1 size strategy: one database until 5 GB, then shard by account or tenant
+group. Cross-shard reporting uses R2 exports, not cross-database joins. The 10 GB
+per-database limit cannot be raised.
 
 ## 13. API
 
 ### 13.1 Conventions
 
 - Base path: `/api/v1`.
-- JSON, UTF-8, `snake_case` fields.
+- JSON, UTF-8, `snake_case`.
 - OpenAPI 3.1 at `/api/v1/openapi.json`.
-- Auth: Access JWT for the SPA, `Authorization: Bearer <token>` for API clients,
-  signed requests with `X-CFB-Agent`, `X-CFB-Key-Id` and `X-CFB-Signature`
-  for agents.
+- Auth: Access JWT for the SPA, bearer token for API clients, signed envelopes
+  for nodes.
 - Errors: `application/problem+json` with `type`, `title`, `status`, `detail`,
   `instance`, `code`, `retryable`, `request_id`.
-- Idempotency: `Idempotency-Key` on POST. The key and a hash of the body are
-  stored for 24 hours. A replay with a different body returns 409.
-- Concurrency: `ETag` on reads, `If-Match` on writes. A stale write returns 409
-  with the current generation.
+- Idempotency: `Idempotency-Key` on POST; key and body hash stored for 24 hours.
+- Concurrency: `ETag` and `If-Match`; stale writes return 409.
 - Pagination: `?limit=50&cursor=...`, response `next_cursor`.
-- Async: `202` with `operation_id` and `Location: /api/v1/operations/{id}`.
-- Events: `GET /api/v1/events?since=...` as SSE; `GET /api/v1/workloads/{id}/logs`
-  as SSE; `GET /api/v1/workloads/{id}/exec` upgrades to WebSocket.
-- Rate limits: per token and per tenant. `429` with `Retry-After`.
+- Async: `202` with `operation_id` and `Location`.
+- Events: SSE for operations and logs; WebSocket for exec.
+- Rate limits per token and tenant; `429` with `Retry-After`.
 
 ### 13.2 Resources
 
@@ -1051,20 +960,18 @@ GET    /api/v1/sites/{id}
 PATCH  /api/v1/sites/{id}
 
 GET    /api/v1/machines
-POST   /api/v1/machines            create a join token and install command
+POST   /api/v1/machines
 GET    /api/v1/machines/{id}
-PATCH  /api/v1/machines/{id}       labels, drain state
-DELETE /api/v1/machines/{id}       decommission, requires approval
-POST   /api/v1/machines/{id}/actions  cordon, drain, reboot, upgrade,
-                                      rotate-token, reprovision
+PATCH  /api/v1/machines/{id}
+DELETE /api/v1/machines/{id}
+POST   /api/v1/machines/{id}/actions
 
 GET    /api/v1/workloads
 POST   /api/v1/workloads
 GET    /api/v1/workloads/{id}
-PATCH  /api/v1/workloads/{id}      desired spec, bumps generation
+PATCH  /api/v1/workloads/{id}
 DELETE /api/v1/workloads/{id}
-POST   /api/v1/workloads/{id}/actions  start, stop, restart, snapshot,
-                                       restore, migrate, exec
+POST   /api/v1/workloads/{id}/actions
 GET    /api/v1/workloads/{id}/logs
 GET    /api/v1/workloads/{id}/events
 
@@ -1130,82 +1037,27 @@ Content-Type: application/json
 }
 ```
 
-### 13.4 Example: error
+### 13.4 Example: unsupported binding
 
 ```http
-HTTP/1.1 409 Conflict
+HTTP/1.1 422 Unprocessable Entity
 Content-Type: application/problem+json
 
 {
-  "type": "https://cfb.example/errors/stale-generation",
-  "title": "Stale generation",
-  "status": 409,
-  "detail": "The workload is at generation 7, not 6.",
+  "type": "https://cfb.example/errors/unsupported-binding",
+  "title": "Unsupported binding",
+  "status": 422,
+  "detail": "Binding AI is not supported on profile lite.",
   "instance": "/api/v1/workloads/w_789",
-  "code": "stale_generation",
+  "code": "unsupported_binding",
   "retryable": false,
   "request_id": "req_..."
 }
 ```
 
-## 14. Agent protocol
+## 14. Broker protocol
 
-### 14.1 Identity and enrollment
-
-- The operator creates a machine and gets a one-time join token, valid for 15
-  minutes and bound to the machine id.
-- The installer writes the token to a systemd credential.
-- The agent generates a key pair locally. The private key never leaves the machine.
-- `POST /v1/enroll` with the join token and the agent's Ed25519 public key. The
-  control plane verifies the token, records the public key, and issues a signed
-  machine credential valid for 24 hours. The credential binds the machine id,
-  key id and expiry; the lease epoch travels in each signed request. It is not a
-  TLS client certificate.
-- The agent renews the credential before expiry by signing the renewal request
-  with its current key.
-- The control plane can revoke the credential and the public key; revocation is
-  checked on every request and on every renewal.
-
-### 14.2 Transport
-
-- Preferred: HTTPS over the machine's Cloudflare Tunnel, reached by the control
-  plane through Workers VPC `fetch()`.
-- Fallback: WebSocket to the relay DO, initiated by the agent.
-- Control path: the agent listens on `127.0.0.1:9443` only. It does not listen
-  on a LAN address. The local admin path uses a Unix socket at
-  `/run/cfb/agent.sock`, mode 0660, group `cfb-admin`, with a peer credential
-  check.
-- Authentication is end-to-end and does not depend on TLS termination. On both
-  Cloudflare paths, Cloudflare terminates TLS, so the Worker never sees the
-  agent's client certificate. Neither path uses mTLS; a self-hosted relay that
-  terminates TLS may add it as an optional deployment.
-- Both directions sign. The control plane holds an Ed25519 signing key; the agent
-  pins its public key at enrollment and verifies every command. The agent signs
-  every heartbeat and response with its machine key; the control plane verifies
-  against the public key recorded at enrollment.
-- The signed input is the canonical tuple `(method, path, body_sha256, ts,
-  nonce, machine_id, lease_epoch)`. The signature and key id travel in
-  `X-CFB-Signature` and `X-CFB-Key-Id`.
-- The receiver rejects a timestamp older than 60 seconds, a reused nonce, or a
-  signature from a revoked key. Nonces are kept in a bounded replay cache.
-
-### 14.3 Endpoints
-
-```
-POST /v1/enroll
-POST /v1/heartbeat
-GET  /v1/desired?since=<generation>
-POST /v1/reconcile
-GET  /v1/state
-POST /v1/events
-POST /v1/logs
-GET  /v1/health
-POST /v1/exec
-POST /v1/snapshot
-POST /v1/upgrade
-```
-
-### 14.4 Envelope
+### 14.1 Envelope
 
 ```json
 {
@@ -1224,208 +1076,95 @@ POST /v1/upgrade
 `sig` covers the canonical envelope without the `sig` field.
 
 Types: `hello`, `heartbeat`, `desired`, `reconcile`, `ack`, `event`, `log`,
-`metric`, `error`, `exec_open`, `exec_data`, `exec_close`.
+`metric`, `error`, `exec_open`, `exec_data`, `exec_close`, `apply`, `route`.
 
-### 14.5 State machine
+### 14.2 Endpoints over the relay
+
+```
+POST /v1/enroll
+POST /v1/heartbeat
+GET  /v1/desired?since=<generation>
+POST /v1/reconcile
+GET  /v1/state
+POST /v1/events
+POST /v1/logs
+GET  /v1/health
+POST /v1/exec
+POST /v1/apply
+POST /v1/route
+```
+
+### 14.3 State machine
 
 ```
 pending -> applying -> running -> stopping -> stopped -> deleting -> deleted
                   \-> failed
-                  \-> degraded (running but unhealthy)
+                  \-> degraded
 ```
 
-Transitions are idempotent. A `reconcile` for a generation already applied returns
+Transitions are idempotent. A reconcile for an already applied generation returns
 the current observed state without calling the runtime.
 
-### 14.6 Heartbeats and leases
+### 14.4 Heartbeats and leases
 
 - Heartbeat every 15 seconds.
-- Liveness deadline 60 seconds; the DO marks the machine offline after 4 missed
-  heartbeats. The fencing epoch does not expire.
-- Heartbeat payload: agent version, uptime, load, capacity, observed digest,
-  runtime health, storage health, clock skew, last command id.
-- A heartbeat does not carry the full workload list. The digest is enough; the
-  control plane asks for a diff when it differs.
+- Liveness deadline 60 seconds; four missed heartbeats marks the node offline.
+- The fencing epoch does not expire.
+- Heartbeat payload: broker version, profile, capabilities, uptime, load,
+  capacity, observed digest, runtime health, storage health, clock skew, last
+  command id.
+- The heartbeat carries a digest, not the full workload list.
 
-### 14.7 Versioning
+### 14.5 Versioning
 
-- `protocol_version` and `agent_version` in every handshake.
+- `protocol_version` and `broker_version` in every handshake.
 - The control plane supports the current and previous protocol major versions.
-- An agent that is too old is drained and upgraded, not silently ignored.
-- Upgrades are signed, canary-first, and reversible.
+- An old broker is drained and upgraded, not silently ignored.
+- Upgrades are signed, canary-first and reversible.
 
-## 15. Operations and SLOs
-
-### 15.1 Enrollment and upgrades
-
-- Enrollment is a Workflow with a human-visible checklist.
-- Agent upgrades are staged: one canary machine per site, then 10%, then the
-  rest. A failed health check rolls back.
-- Agent binaries are signed and verified before execution.
-- The control plane keeps the last two agent versions.
-
-### 15.2 Observability
-
-- OpenTelemetry in the agent and the control plane.
-- Metrics: Prometheus or VictoriaMetrics on a site; remote write to the control
-  plane for aggregates. Do not send every raw sample to D1.
-- Logs: local Loki or plain files; upload to R2 in chunks; index in D1 by key.
-- Traces: Tempo or an OTLP endpoint; sample adaptively.
-- Dashboards: SPA for fleet health; Grafana for deep debugging.
-- Alerts: lease expiry, machine offline, disk > 85%, replication lag > RPO,
-  credential expiry < 7 days, failed reconciles > 3, queue depth > threshold,
-  unusual egress, and audit chain failure.
-
-### 15.3 SLOs
-
-| SLO | Target | Measurement |
-| --- | --- | --- |
-| Control-plane API availability | 99.9% monthly | Successful requests / total, excluding 4xx |
-| Dashboard availability | 99.9% monthly | Synthetic check from two regions |
-| Machine heartbeat freshness | 95% < 30 s | Agent and DO timestamps |
-| Container start (cached image) | p95 < 10 s | Agent operation log |
-| Worker start (warm) | p95 < 1 s | open-compute / workerd log |
-| Sandbox start (warm pool) | p95 < 1 s | Agent operation log |
-| Provisioning a new machine | p95 < 10 min | Workflow timestamps |
-| Log delivery to R2 | p95 < 10 s | Chunk timestamp vs upload |
-| Control-plane metadata RPO | 15 min | Backup and export timestamps |
-| Tenant object offsite RPO | 15 min | Replication lag |
-| Audit export RPO | 5 min | Export cursor |
-
-These are design targets, not measured results. Measure them before publishing
-them to users.
-
-### 15.4 Capacity planning
-
-- Reserve 20% headroom per machine for the agent, `cloudflared`, images and
-  snapshots.
-- Cap containers per machine by CPU and memory, not by count.
-- Keep one machine per site able to run the control-plane fallback relay? No:
-  the relay is a Cloudflare DO, not on the machine.
-- Keep a warm image cache sized to the top 10 images per site.
-- Track storage growth per tenant and alert at 70% and 85%.
-
-### 15.5 Incident response
-
-1. Revoke the machine credential and key, and delete the tunnel connections.
-2. Cordon the machine; do not place new workloads.
-3. Snapshot the local state and logs for forensics before rebuilding.
-4. Rotate any secret the machine could reach.
-5. Rebuild the machine from a known image; re-enroll with a new identity.
-6. Write a post-incident record with a timeline, root cause, and the control that
-   prevents recurrence.
-
-## 16. Security summary
-
-The full threat model is in `docs/security.md`. The load-bearing controls:
-
-- Access JWT validation at the Worker for `/api/*`, with issuer and audience
-  checks.
-- Machine key signatures, a short-lived machine credential, key pinning and
-  revocation.
-- One tunnel and one identity per machine.
-- No inbound ports; no SSH control path.
-- Default-deny egress per workload.
-- MicroVM isolation for untrusted code; containers only for trusted code.
-- workerd only inside a VM or a dedicated machine.
-- Signed images and bundles; digest pinning; SBOM.
-- Plaintext secrets never in D1, R2, logs or the SPA. Secret ciphertext may
-  live in D1 under envelope encryption.
-- Hash-chained audit log with a WORM export.
-- Two-person approval for destructive operations.
-
-## 17. Cost summary
-
-The control plane is cheap at small scale: Workers Paid is $5/month with 10M
-requests and 30M CPU-ms; D1, R2, DO and Queues are metered but small for a
-fleet dashboard. Tunnels are free up to 1,000 per account, then $4.50 per tunnel
-per month. Access is free for teams under 50 users, then $7 per user per month,
-paid annually.
-
-The data plane is not free. The costs are hardware amortization, power, bandwidth,
-storage media, replacement, and operator time. Self-hosting wins when utilization
-is high and egress is expensive; it loses when a machine sits idle or when one
-person spends a day a week on it.
-
-The full model, with formulas and a worked example, is in `docs/cost.md`.
-
-## 18. Prior art summary
-
-The strongest reusable pieces found on GitHub, with verified metadata:
-
-| Need | Best pick | Why | Main gap |
-| --- | --- | --- | --- |
-| Site runtime | Incus | Apache-2.0, REST API, containers and VMs, clustering, projects | Shared kernel for containers; cluster is per site |
-| Workers platform | open-compute | One binary, workerd fork, Workers/KV/D1/R2/DO/Queues/Workflows/Cron, SQLite/S3 | Single node, not HA; young |
-| Distributed DO | celld | Closest DO semantics on private hardware, S3-backed leases | Beta, one app per fleet, no TLS |
-| Raw Workers runtime | workerd | The actual runtime, Apache-2.0, active | Not a hardened sandbox; no platform |
-| Actor platform | Rivet | Durable actors, SQLite, queues, scheduling, self-hostable | Not Workers-compatible |
-| Sandbox | Firecracker | Per-VM API, jailer, snapshots | You build the scheduler |
-| Sandbox orchestrator | bhatti / hyper / Fireactions | Higher-level microVM management | Young; Fireactions is GitHub-specific |
-| S3 | SeaweedFS | S3, IAM/STS, EC, replication, single-node path | More moving parts |
-| S3 alternative | RustFS | Apache-2.0, MinIO-compatible, EC, site replication | Younger; compatibility gaps |
-| CI (GitHub) | Fireactions | Ephemeral Firecracker runners, JIT tokens, pool scaling | GitHub-specific |
-| CI (Gitea/Forgejo) | Woodpecker | Server + agent, autoscaler, Apache-2.0 | Autoscaler not feature-complete |
-| Tunnel | cloudflared + VPC | Outbound-only, identity, dynamic routes | VPC beta; 1,000 tunnel limit |
-| Control-plane references | amika, Coolify, Dokploy, Portainer | Host agent, PaaS domain model, RBAC, edge agent | None is a multi-tenant CF-native control plane |
-
-The detailed catalog, licenses, star counts and verdicts are in
-`docs/prior-art.md`. Metadata was captured on 2026-10-29; see
-`evidence/repos.tsv`.
-
-## 19. Risks and open questions
+## 15. Risks and open questions
 
 | Risk | Impact | Mitigation | Status |
 | --- | --- | --- | --- |
-| Workers VPC is beta and may change | Private control path breaks | `PrivateTransport` abstraction; relay DO fallback; public hostname + Access fallback | Open |
-| Tunnel limit and per-tunnel price | Fleet cost grows beyond 1,000 machines | Tunnels for Platforms; site-level tunnel for large sites; measure | Open |
-| Access app and service-token limits | Cannot model one app/token per tenant | One app for the console; tenant authorization in the API; service tokens only per environment | Open |
-| D1 10 GB per database | Metadata outgrows one DB | Shard by account/tenant; export reporting to R2 | Open |
-| DO soft 1,000 req/s per object | A busy machine's coordinator saturates | Shard by machine; aggregate heartbeats; backpressure | Open |
-| Incus containers share the kernel | Container escape is a host compromise | MicroVM for untrusted; seccomp; no privileged containers | Accepted |
-| Firecracker needs KVM | Not available on cheap VPS or without nested virt | Bare metal or KVM-capable hosts; fall back to Incus VMs | Open |
-| open-compute is young | Bugs and compatibility gaps | Pin versions; canary; keep raw workerd fallback | Open |
-| celld is pre-1.0 and single-app | No multi-tenant DO fleet | One fleet per tenant; wait; or Rivet | Accepted |
-| Licensing | AGPL/BUSL/SSPL blocks a hosted service | Apache/MIT first; legal review; isolate copyleft components | Open |
-| Operator time | Self-hosting becomes a second job | SLOs, automation, runbooks, start with one site | Open |
-| Data durability | A site loss loses data | 3-2-1, R2 offsite, restore drills | Open |
-| Control-plane compromise | Attacker can command the fleet | Least privilege, audit, two-person approval, machine credential and key revocation | Open |
-| Supply chain | A malicious image or bundle | Signatures, digests, SBOM, admission | Open |
+| Relay DO message billing | High-volume logs and ingress cost more than a tunnel | Native tunnel option; batch frames; keep bulk data on S3 | Open |
+| WSS throughput and latency | Interactive exec and large responses are slower than QUIC | Measure; cap frame size; credit flow control; native tunnel | Open |
+| workerd is not a sandbox | Host compromise from hostile code | MicroVM for untrusted; `lite` trusted only | Accepted |
+| Binding shim semantics | D1/KV/Queues behave differently from Cloudflare | Conformance suite; fail closed; mark unsupported | Open |
+| Native tunnel incomplete | No `cloudflared` replacement yet | Relay default; cfrs research; keep cloudflared as fallback | Open |
+| Rootless limits | No netns, KVM or cgroups on some hosts | Capability negotiation; `lite` profile | Accepted |
+| S3 gateway correctness | Data loss or incompatible clients | Narrow subset; checksum tests; delegate to SeaweedFS/RustFS | Open |
+| Cloudflare API drift | Wrangler config or binding changes | Pin supported versions; conformance gate | Open |
+| D1 10 GB per database | Metadata outgrows one DB | Shard by tenant; export reporting to R2 | Open |
+| DO soft 1,000 req/s | Busy coordinator or relay saturates | Shard by machine; aggregate heartbeats; backpressure | Open |
+| Access limits | 500 apps, 50 service tokens | One console app; tenant auth in API | Open |
+| Licensing | AGPL/BUSL/SSPL blocks a hosted service | Apache/MIT/0BSD first; legal review | Open |
+| Operator time | Self-hosting becomes a second job | Automation, SLOs, start with one site | Open |
+| Data durability | Site loss loses data | 3-2-1, R2 offsite, restore drills | Open |
+| Supply chain | Malicious image or bundle | Signatures, digests, SBOM, admission | Open |
 
-Open questions that need a prototype, not an opinion:
+Open questions that need a prototype:
 
-1. Does `cf1:network` reach a route on a tunnel created after the binding, with
-   no Worker redeploy? The docs say it does; test it. If it does not, fall back
-   to a `tunnel_id` binding per site.
-2. What is the real throughput and latency of Workers VPC `fetch()` to an agent,
-   including streaming logs and exec? Measure.
-3. Does a WebSocket survive a VPC `fetch()` upgrade? If not, the relay is
-   mandatory for exec.
-4. How fast is Incus container creation on the target hardware, warm and cold?
-5. How fast is Firecracker restore from a snapshot on the target hardware?
-6. What is the actual per-machine `cloudflared` throughput and CPU cost?
-7. How much does open-compute cost in memory and CPU per idle tenant?
-8. What is the real D1 query latency from the control plane's region?
-9. Can the audit hash chain be implemented with D1 triggers, or must it be in the
-   Worker?
-10. What is the restore time for a 1 TB bucket from R2?
+1. What is the throughput and latency of the relay WebSocket for 1 MiB
+   responses and for exec streams?
+2. Does a WSS relay survive Cloudflare's idle and message limits for a fleet of
+   1,000 nodes?
+3. Can the generated binding shim match D1 SQL semantics closely enough for
+   real Workers code?
+4. How much memory and CPU does workerd use per idle tenant on a 512 MB node?
+5. What is the cold and warm start time for rootless Podman on the target
+   hardware?
+6. Can `cfrs` be extended to a full tunnel registration and serve loop without
+   the Cloudflare-internal roots?
+7. What is the S3 gateway throughput on local NVMe versus SeaweedFS?
+8. Does the native tunnel work through a proxy that only allows HTTP CONNECT on
+   443?
+9. What is the restore time for a 1 TB bucket from R2?
+10. Which Workers APIs used by real applications are missing from the supported
+    subset?
 
-## 20. Glossary
+## 16. References
 
-- **Agent**: the host process that reconciles desired state on a machine.
-- **Control plane**: the Cloudflare-hosted API, dashboard, identity and metadata.
-- **Data plane**: the machines and runtimes that execute workloads.
-- **DO**: Cloudflare Durable Object; also used for the per-machine coordinator.
-- **Fencing epoch**: a monotonic number that invalidates stale writers.
-- **Generation**: a monotonic number for a workload spec.
-- **Lease**: a time-bounded right to act on a machine.
-- **Site**: a trust and failure domain (rack, home, colo, region).
-- **Workload**: a container, VM, sandbox, Worker, durable actor, CI runner or
-  storage service managed by CFB.
-
-## 21. References
-
-Cloudflare, read 2026-10-29:
+Cloudflare, read 2026-10-29. Captures in `evidence/cf-docs/`.
 
 - Containers limits: https://developers.cloudflare.com/containers/platform/limits/
 - Containers pricing: https://developers.cloudflare.com/containers/platform/pricing/
@@ -1449,9 +1188,7 @@ Cloudflare, read 2026-10-29:
 - Faster agent sandboxes: https://blog.cloudflare.com/faster-agent-sandboxes/
 - Cloudflare Computer: https://blog.cloudflare.com/cloudflare-computer/
 
-Captured copies of these pages are in `evidence/cf-docs/`.
-
-Project sources, read 2026-10-29:
+Projects, read 2026-10-29. Captures in `evidence/reads/`.
 
 - workerd: https://github.com/cloudflare/workerd
 - open-compute: https://github.com/elliothux/open-compute
@@ -1468,8 +1205,11 @@ Project sources, read 2026-10-29:
 - RustFS: https://github.com/rustfs/rustfs
 - Woodpecker: https://github.com/woodpecker-ci/woodpecker
 - cloudflared: https://github.com/cloudflare/cloudflared
+- cfrs: https://github.com/talaria0101/cfrs
+- mirrord: https://github.com/metalbear-co/mirrord
+- ServerBee: https://github.com/ZingerLittleBee/ServerBee
+- homelable: https://github.com/Pouzor/homelable
+- CoreObs: https://github.com/crocofied/CoreObs
+- omnyssh: https://github.com/timhartmann7/omnyssh
 - Pangolin: https://github.com/fosrl/pangolin
 - NetBird: https://github.com/netbirdio/netbird
-
-Metadata captures are in `evidence/repos.tsv`; page captures are in
-`evidence/reads/`.

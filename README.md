@@ -1,73 +1,62 @@
-# CFB: a Cloudflare-hosted control plane for machines you own
+# CFB: a portable Cloudflare-compatible broker for machines you own
 
-CFB is a design for replacing Cloudflare's paid runtime services (R2, Containers,
-Sandbox, Computer, Workers, Durable Objects, Workers CI) with workloads that run
-on hardware you control, while the dashboard, API, identity and audit plane stay
-on Cloudflare.
+CFB keeps the control plane on Cloudflare and runs one daemon, `cfbd`, on each
+machine. The daemon exposes Cloudflare's data-plane contracts locally: Workers
+bundles run on workerd, object storage speaks S3, containers run as OCI images,
+and the host reaches the control plane over an outbound WebSocket on port 443.
+For the supported subset, the same artifact and binding names run on Cloudflare
+or on a node with no application source change and at most a deploy-target
+change. Anything outside that subset fails at deploy with a named error.
 
-The short version:
+This repository is a design and evidence record. It contains no implementation.
+External numbers and repository metadata are tied to captures under `evidence/`.
+Feature claims are labelled by evidence type. The verification boundary is in
+`docs/research.md`.
 
-- The control plane is a Workers app with a SPA, a Hono API, D1, R2, Durable
-  Objects, Queues, Workflows and Access.
-- The data plane is one or more machines you own. Each runs a single outbound-only
-  host agent, `cloudflared`, and one or more runtimes (Incus, containerd,
-  Firecracker, open-compute/workerd, SeaweedFS, Woodpecker or Fireactions).
-- There are no inbound ports on the machines. Cloudflare Tunnel carries control
-  traffic and optional public ingress. The control plane reaches agents through
-  Workers VPC, with a relay Durable Object as a fallback.
-- The control plane stores intent. The data plane stores execution state. If the
-  control plane is down, workloads keep running and the last desired state keeps
-  being reconciled.
+## The shape
 
-The design is deliberately not a Cloudflare clone. It is a smaller system with a
-clear split: Cloudflare is good at identity, global ingress, durable metadata and
-a dashboard; your machines are good at long-running compute, local storage and
-egress-heavy work.
+| Plane | Where it runs | What it does |
+| --- | --- | --- |
+| Control plane | Cloudflare Workers, D1, R2, Durable Objects, Queues, Access | Identity, inventory, desired state, policy, audit, dashboard |
+| Relay | Cloudflare Worker and one Durable Object per machine | Terminates the outbound WebSocket and multiplexes streams |
+| Node | One `cfbd` process per machine, plus optional runtime children | Tunnel client, router, supervisor, S3 gateway, metrics |
+| Runtime | workerd, rootless Podman, Incus, Firecracker, storage server | Executes the portable artifact |
 
-## Read this first
+The node never listens for inbound traffic. `cfbd` dials `wss://` on 443 and the
+relay opens streams to a local Unix socket. Native Cloudflare Tunnel over
+QUIC/HTTP2 is an optional transport, not a requirement. This is what makes the
+same design work on a 512 MB VPS with no root and no inbound firewall rule.
 
-| Document | What it answers |
+## Portability contract
+
+CFB does not invent a second application API. It implements existing contracts:
+
+- Workers source, `wrangler.jsonc` binding names and Durable Object classes.
+- S3 for object storage, so an AWS SDK client can switch endpoints.
+- OCI images for containers, so the same image runs under Podman or a
+  Cloudflare container.
+- GitHub Actions or Woodpecker workflows for CI, with the same YAML.
+- HTTP and WebSocket for application ingress.
+
+Compatibility is layered: source, configuration, protocol, then semantics. The
+design targets the first three; semantic equivalence is a test result, not a
+slogan. Unsupported bindings fail at deploy or at first use with a named error.
+The matrix and the supported subset are in `docs/spec.md`.
+
+## Repository map
+
+| File | Contents |
 | --- | --- |
-| [`docs/spec.md`](docs/spec.md) | The architecture, components, data model, API, agent protocol, operations and SLOs |
-| [`docs/reference-deployment.md`](docs/reference-deployment.md) | Three concrete topologies, the software matrix, bootstrap order, and a workerd-on-a-machine recipe |
-| [`docs/prior-art.md`](docs/prior-art.md) | The tools on GitHub that already solve parts of this, with verified metadata and a build-vs-buy verdict |
-| [`docs/decisions.md`](docs/decisions.md) | The load-bearing choices, the alternatives, and why they were rejected |
-| [`docs/security.md`](docs/security.md) | Threat model, isolation matrix, identity, secrets, supply chain, audit |
-| [`docs/cost.md`](docs/cost.md) | Control-plane list prices, a parametric data-plane model, break-even, hidden costs |
-| [`docs/roadmap.md`](docs/roadmap.md) | Phases, exit criteria, MVP scope, and what not to build |
-| [`docs/critique.md`](docs/critique.md) | The strongest objections to this design, with responses and residual risk |
-| [`docs/research.md`](docs/research.md) | How the research was done, what was verified directly, what was not |
-
-## The one-paragraph architecture
-
-A browser loads a Vite SPA from a Workers static-assets deployment. Cloudflare
-Access authenticates the user; the Worker validates the Access JWT and loads the
-user's role from D1. The API writes desired state to D1 and a per-machine Durable
-Object, then enqueues a reconcile command. The machine's host agent, which has
-already dialed out through a per-machine Cloudflare Tunnel, receives the command
-over Workers VPC, applies it to Incus, containerd, Firecracker, open-compute or a
-Woodpecker runner, and reports observed state back. Artifacts, logs, images and
-backups live in local S3 (SeaweedFS or RustFS) and are replicated to R2. Public
-ingress goes through the same Tunnel and an Access policy. Nothing on the machine
-listens on a public port.
-
-## How to use this repository
-
-1. Read `docs/spec.md` sections 1 to 5 for the shape, then section 9 for
-   orchestration and section 14 for the agent protocol.
-2. Pick the closest topology in `docs/reference-deployment.md` and read its
-   verification checklist.
-3. Run the Phase 0 spikes in `docs/roadmap.md` before writing code. They are
-   designed to kill the design cheaply if a load-bearing assumption is wrong.
-4. Use `docs/prior-art.md` to choose components, and `docs/decisions.md` to see
-   what was rejected and why.
-5. Read `docs/critique.md` before committing to the build. It contains the
-   strongest arguments against it.
+| `docs/spec.md` | Architecture, broker, transport, portability, orchestration, API, protocol |
+| `docs/security.md` | Threat model, identity, isolation, constrained-mode limits |
+| `docs/cost.md` | Cloudflare list prices, data-plane model, break-even |
+| `docs/reference-deployment.md` | Standard, constrained and storage/CI profiles |
+| `docs/prior-art.md` | Evaluated projects, licences, reusable parts, traps |
+| `docs/research.md` | Evidence log, verification labels, open questions |
+| `docs/decisions.md` | Decision records with rejected alternatives |
+| `docs/roadmap.md` | Phases and exit criteria |
+| `evidence/` | Captured Cloudflare docs, repository metadata and READMEs |
 
 ## Status
 
-Design draft, 2026-10-29. No implementation is claimed. Every external number and
-repository metadata field in the documents carries a capture date and a source;
-see [`docs/research.md`](docs/research.md) for the verification boundary.
-
-License: 0BSD. See [`LICENSE`](LICENSE).
+Design draft, 2026-10-29. No implementation is claimed. Licence: 0BSD.

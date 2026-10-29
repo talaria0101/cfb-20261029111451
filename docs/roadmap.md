@@ -1,290 +1,230 @@
 # Roadmap
 
-The roadmap is ordered by risk and by the first bill it removes. Each phase has
-an exit criterion that can be tested, not a feeling that it is done.
+Phases are ordered by risk. Each phase has an exit criterion that can be tested,
+not a feeling that it is done. No estimates are given: a date without a measured
+velocity would be invented.
 
-## Phase 0: Spikes and decisions (2 weeks)
+## Phase 0: Spikes
 
 **Goal.** Retire the assumptions that would change the architecture.
 
-**Work.**
+1. Measure relay WebSocket throughput and latency for 1 MiB responses, exec
+   streams and 1,000 nodes. Record message counts and DO duration.
+2. Measure workerd idle memory and CPU per tenant on a 512 MB and a 1 GB node.
+3. Build a throwaway shim for R2 `get`/`put` and D1 `prepare`/`all` and run a real
+   Worker against both Cloudflare and the shim. Record the semantic gaps.
+4. Measure rootless Podman cold and warm container start on target hardware.
+5. Measure Firecracker boot and snapshot restore on a KVM host.
+6. Confirm which constrained hosts have KVM, user namespaces, cgroup v2 and
+   FUSE. Record the profile each can support.
+7. Test the relay through an HTTPS-only proxy and through a network that breaks
+   long-lived sockets.
+8. Test cfrs edge discovery and header serialization against a real tunnel
+   endpoint. Confirm that registration and visitor serving are the only missing
+   pieces.
 
-1. Prove Workers VPC reaches an agent through a tunnel with a `cf1:network`
-   binding. Measure request latency and log streaming.
-2. Prove or disprove WebSocket upgrades through VPC `fetch()`. If they fail,
-   build the relay path first.
-3. Measure Incus container create, start and stop on the target hardware, warm
-   and cold.
-4. Measure Firecracker boot and snapshot restore on the target hardware.
-5. Measure `cloudflared` throughput and CPU at 10 Mbit/s, 100 Mbit/s and 1
-   Gbit/s.
-6. Install open-compute on one machine, deploy a hello-world Worker, and
-   measure idle memory and cold start.
-7. Install celld on two machines with an S3 bucket and verify DO failover.
-8. Confirm the target machines have KVM and the required kernel modules.
+**Exit criteria.** A written result for each spike with a command, a measurement
+and a date. A keep-or-replace decision for the relay, workerd shim, Podman,
+Firecracker and native tunnel.
 
-**Exit criteria.**
+**If a spike fails.** Relay fails: investigate native tunnel or a self-hosted
+relay. workerd shim fails: narrow the supported subset and fail closed. KVM is
+absent: no untrusted sandboxes on that host. Podman is unavailable: `lite` only.
 
-- A written result for each spike with a command, a measurement and a date.
-- A decision to keep or replace Workers VPC, Incus, Firecracker, open-compute
-  and celld.
-- No open question in `docs/spec.md` section 19 that blocks Phase 1.
+## Phase 1: Control plane skeleton
 
-**If a spike fails.**
+**Goal.** A deployable Cloudflare app with identity, inventory, audit and a fake
+machine driver. No real nodes yet.
 
-- VPC fails: implement the relay first and treat VPC as an optimization.
-- WebSocket fails: exec goes through the relay from day one.
-- KVM is unavailable: sandboxes use Incus VMs or gVisor, with a documented
-  isolation downgrade.
-- open-compute is unusable: raw workerd plus a supervisor, or defer Workers to
-  Phase 5.
-
-## Phase 1: Control plane skeleton (4 to 6 weeks)
-
-**Goal.** A deployable Cloudflare app with identity, inventory and audit. No
-machines yet.
-
-**Deliverables.**
-
-- Vite SPA served from Workers static assets with SPA fallback.
+- Vite SPA on Workers static assets with SPA fallback.
 - Hono API with OpenAPI 3.1, problem+json, idempotency and ETag.
 - Access JWT validation with issuer and audience checks.
 - D1 schema: accounts, users, memberships, tenants, sites, machines, audit,
   outbox.
-- RBAC and tenant scoping enforced in every query.
+- RBAC and tenant scoping in every query.
 - Hash-chained audit with a verification job.
-- A fake machine driver for local development and tests.
-- CI: type check, unit tests, a D1 migration test, a deploy to a staging account.
+- Fake machine driver for local development.
+- CI: type check, unit tests, migration test, staging deploy.
 
-**Exit criteria.**
+**Exit criteria.** A user logs in through Access, creates a tenant and a site, and
+sees an audit record. A second tenant cannot read the first tenant's resources by
+id. The audit chain verifies and a tampered row fails. A clean staging deploy is
+reproducible from one documented command.
 
-- A user can log in through Access, create a tenant and a site, and see an audit
-  record for each action.
-- A second tenant cannot read the first tenant's resources, including by direct
-  id access.
-- The audit chain verifies, and a tampered row fails verification.
-- A staging deploy is reproducible from a clean account with a documented
-  command.
+## Phase 2: Broker transport and enrollment
 
-**What not to build yet.** Real machines, real runtimes, billing, a tenant
-portal, multi-region.
+**Goal.** One `cfbd` binary connects to the relay, enrolls, heartbeats and stores
+local state. No workloads yet.
 
-## Phase 2: One machine, containers (6 to 8 weeks)
+- Ed25519 key generation, one-time join token, 24-hour credential.
+- Signed envelope on every request, replay cache, clock-skew check.
+- Relay Worker and per-machine DO with WebSocket hibernation.
+- Stream framing, credit flow control, half-close, reconnect with jitter.
+- Local SQLite: desired, observed, operations, events.
+- Local Unix socket API with peer credential checks.
+- `cfbd status`, `cfbd logs`, `cfbd drain`, `cfbd rotate-key`.
+- Profile detection and capability report.
 
-**Goal.** Enroll one machine and manage Incus containers from the SPA.
+**Exit criteria.** A node enrolls in under 10 minutes with no SSH. A revoked key
+cannot reconnect. Killing the control plane does not stop the broker. A duplicate
+command is a no-op. A stale lease epoch is rejected. The broker has no TCP
+listener in `lite`.
 
-**Deliverables.**
+## Phase 3: workerd and the binding shim
 
-- Host agent with signed enrollment and requests, heartbeat and a local SQLite
-  cache. Signatures authenticate both paths; no mTLS on the Cloudflare paths.
-- Incus driver: create, start, stop, delete, stats, logs.
-- Per-machine DO with lease, fencing epoch, command queue and live events.
-- One-time join token and a signed install script.
-- Tunnel creation and a `cf1:network` binding.
-- Desired-state reconciliation with generations.
-- Dashboard: machine detail, workload list, create/stop/delete, live status.
-- A relay transport behind the same interface (even if unused).
+**Goal.** Deploy a Worker bundle to a node and reach it through the relay.
 
-**Exit criteria.**
+- Parse `wrangler.jsonc`, reject unsupported bindings with a named error.
+- Generate `workerd.capnp` and the R2/D1/KV/Queues shim.
+- Version directories, content-addressed bundles, signature verification.
+- Atomic route swap after a smoke request; keep the previous version.
+- Relay ingress: host and path to a local Unix socket.
+- Logs and metrics into the dashboard.
+- Conformance suite: the same Worker on Cloudflare and the node.
 
-- A new machine is enrolled from the dashboard in under 10 minutes with no SSH.
-- A container is created, stopped, started and deleted from the SPA.
-- Killing the control plane does not stop a running container; restarting the
-  control plane reconciles state without duplicating it.
-- Revoking the machine credential and key blocks the agent within one heartbeat.
-- A duplicate `reconcile` command is a no-op.
-- A stale lease epoch is rejected.
+**Exit criteria.** A Worker deployed from CI is reachable through the relay with
+Access in front. A rollback restores the previous bundle in under 30 seconds. A
+tampered bundle is rejected. An unsupported binding is rejected at upload. The
+conformance suite reports a per-primitive result, including failures.
 
-**This is the first usable product.** It replaces "SSH and docker run" with a
-dashboard, an audit trail and a lease.
+**This is the first useful product for a `lite` node.** It replaces a small
+Workers project and a static site with no root and no inbound port.
 
-## Phase 3: Storage and volumes (4 to 6 weeks)
+## Phase 4: Containers
 
-**Goal.** Tenant buckets and volumes, with an offsite copy.
+**Goal.** Rootless OCI containers on a `standard` node.
 
-**Deliverables.**
+- Podman driver over the user socket: create, start, stop, delete, stats, logs,
+  exec.
+- Image pull by digest, signature verification, admission policy.
+- Per-workload network namespace and default-deny egress.
+- CPU and memory limits through cgroups v2 when delegated, rlimits otherwise.
+- Route integration for container HTTP services.
+- Warm image cache for the top images per site.
 
-- SeaweedFS install and lifecycle on a machine.
-- Bucket create/delete, per-tenant credentials, presigned URLs.
-- Volume create/attach/detach/snapshot on Incus.
-- Replication worker from local S3 to R2 with checksums.
-- Lifecycle policy: hot to R2 IA, retention, delete.
+**Exit criteria.** A container is created, stopped, started and deleted from the
+SPA. A container cannot reach the broker socket, the metadata address or another
+tenant. Killing the control plane does not stop it. Restarting the broker
+reconciles without duplicating it. A bad signature is rejected.
+
+## Phase 5: Storage
+
+**Goal.** Tenant buckets and volumes with an offsite copy.
+
+- Local S3 gateway: Head, Get, Put, Delete, ListV2, multipart.
+- Presigned URL minting in the signer Worker and verification in the broker.
+- SeaweedFS or RustFS backend for multi-node sites.
+- Volume create, attach, detach and snapshot.
+- Replication to R2 with checksums and lag metrics.
+- Lifecycle to R2 IA, retention and delete.
 - Restore drill script and a dashboard action.
 - Usage metering per tenant.
 
-**Exit criteria.**
+**Exit criteria.** A tenant uploads and downloads through a presigned URL without
+seeing a root credential. A deleted object is gone per policy. A restore of a
+random object matches the checksum. A stopped storage node does not lose data.
+Replication lag is visible and alerts above the RPO.
 
-- A tenant can upload and download through a presigned URL without seeing the
-  root credential.
-- A deleted object is gone from the local store and the replica according to
-  policy.
-- A restore of a random object from R2 matches the local checksum.
-- Replication lag is visible and alerts above the RPO.
-- A disk failure on a three-node cluster does not lose data (test with one node
-  stopped).
+## Phase 6: Sandboxes and VMs
 
-## Phase 4: Sandboxes (4 to 6 weeks)
-
-**Goal.** Firecracker sandboxes with a small API and a warm pool.
-
-**Deliverables.**
+**Goal.** Firecracker sandboxes and Incus VMs in the `privileged` profile.
 
 - Firecracker driver: create, exec, file read/write, port forward, snapshot,
   restore, destroy.
 - Jailer configuration and a minimal rootfs.
-- Warm pool per image with a target size.
+- Warm pool per image.
 - TTL and idle timeout enforcement.
 - Egress proxy and default-deny policy.
-- SDK endpoint compatible with the shape in `docs/spec.md` section 11.3.
-- Dashboard: sandbox list, TTL, live CPU/memory, kill.
+- Incus VM driver for semi-trusted workloads.
+- Dashboard: sandbox list, TTL, live CPU and memory, kill.
 
-**Exit criteria.**
+**Exit criteria.** A warm sandbox starts in under 1 second p95 and cold in under 3
+seconds p95 on target hardware. A sandbox cannot reach the host, the broker, the
+metadata address or another sandbox. A snapshot restores to a working filesystem.
+An expired sandbox is destroyed. A broker restart cleans orphan VMs.
 
-- A sandbox starts from a warm pool in under 1 second p95 on the target
-  hardware, and cold in under 3 seconds p95.
-- A sandbox cannot reach the host agent, the metadata address, or another
-  sandbox.
-- A snapshot restores to a working filesystem.
-- An expired sandbox is destroyed and its resources are reclaimed.
-- Killing the agent does not leave orphan VMs after restart (reconcile cleans
-  them).
-
-## Phase 5: Workers and Durable Objects (4 to 6 weeks)
-
-**Goal.** Deploy a Worker bundle to a machine and reach it through the tunnel.
-
-**Deliverables.**
-
-- open-compute install, lifecycle and health.
-- Bundle upload to R2, signature verification, local content-addressed store.
-- Deploy, promote and rollback through the agent.
-- Route creation on the tunnel and Access policy.
-- Logs and metrics from open-compute into the dashboard.
-- celld evaluation for distributed DO; a single-tenant fleet if it passes.
-- A raw workerd fallback path for a binding that open-compute lacks.
-
-**Exit criteria.**
-
-- A Worker deployed from CI is reachable at a hostname with Access in front.
-- A rollback restores the previous bundle in under 30 seconds.
-- A tampered bundle is rejected by the agent.
-- A Worker cannot reach another tenant's KV or R2 namespace.
-- DO state survives an agent restart (single node) and a celld node loss (fleet),
-  with the documented caveats.
-
-## Phase 6: CI (3 to 4 weeks)
+## Phase 7: CI
 
 **Goal.** Replace Workers CI for one real repository.
 
-**Deliverables.**
-
-- Fireactions integration for GitHub: pool config, JIT tokens, runner lifecycle.
-- Woodpecker integration for Gitea/Forgejo.
+- GitHub Actions runner or Fireactions pool: config, JIT tokens, lifecycle.
+- Woodpecker agent for Gitea or Forgejo.
 - Webhook verification and job records.
 - Log streaming to R2 and the SPA.
 - Artifact manifest and retention.
 - Concurrency, timeout and quota enforcement.
-- A cache bucket per tenant.
+- Cache bucket per tenant.
 
-**Exit criteria.**
+**Exit criteria.** A real repository runs a job longer than 20 minutes on an owned
+runner. Logs are live and retained, and a secret in a log is masked. A cancelled
+job destroys its runner within 60 seconds. A job cannot read another tenant's
+cache or artifacts.
 
-- A real repository runs a job longer than 20 minutes on an owned runner.
-- Logs are visible live and after the job, and a secret in a log is masked.
-- A cancelled job destroys its runner within 60 seconds.
-- A job cannot read another tenant's cache or artifacts.
-- Queue wait time and run time are visible per repo.
+## Phase 8: Hardening
 
-## Phase 7: Hardening and multi-site (ongoing)
+**Goal.** Operable by someone who did not build it.
 
-**Goal.** Make it operable by someone who did not build it.
-
-**Work.**
-
-- Multi-site placement, site loss drills, and cross-site restore.
-- Agent self-update with canary and rollback.
+- Multi-site placement, site-loss drills, cross-site restore.
+- Broker self-update with canary and rollback.
 - Break-glass path, tested quarterly.
 - Backup and restore automation with a monthly drill.
-- Load tests at 10x the expected fleet size.
+- Load test at 10x the expected fleet.
 - Penetration test and a fix round.
 - Runbooks for the top 10 incidents.
 - Cost dashboard and quota alerts.
-- Licence review of every dependency that ships.
-- Documentation: install, upgrade, recover, rotate, decommission.
+- Licence review of every shipped dependency.
+- Install, upgrade, recover, rotate and decommission documentation.
 
-**Exit criteria.**
+**Exit criteria.** A new operator enrolls a machine and deploys a workload using
+only the documentation. A site is lost and restored within the documented RTO. A
+failed broker upgrade rolls back. The audit chain survives a D1 restore and
+verifies against the R2 anchor.
 
-- A new operator can enroll a machine and deploy a workload using only the
-  documentation.
-- A site can be lost and restored within the documented RTO.
-- An agent upgrade rolls back automatically on a failed health check.
-- The audit chain survives a D1 restore and verifies against the R2 anchor.
+## MVP
 
-## MVP definition
+Phase 1 plus Phase 2 plus Phase 3 plus the smallest slice of Phase 4:
 
-The MVP is Phase 1 plus Phase 2 plus the smallest useful slice of Phase 3:
-
-- One Cloudflare account, one tenant, one site, up to 10 machines.
+- One Cloudflare account, one tenant, one site, up to 10 nodes.
 - Access login, RBAC, audit.
-- Enroll a machine with no SSH.
-- Create, start, stop and delete Incus containers from the SPA.
+- Enroll a node with no SSH.
+- Deploy a Worker bundle through the relay with the supported shim.
+- Create, start, stop and delete a rootless container.
 - One bucket per tenant with presigned access and an R2 replica.
 - Live status, logs and a basic cost view.
 
-That MVP replaces a meaningful part of Containers and R2 for a small fleet. It
-does not replace Workers, DO or CI yet.
+That replaces a small Workers project, a container and a bucket. It does not
+replace sandboxes, CI or a global edge.
 
-## Sequencing rationale
+## Sequence rationale
 
-1. **Control plane first, because it is the product.** The runtimes are
-   replaceable; the control plane, the agent protocol and the data model are not.
-2. **Containers before sandboxes, because containers are the common case.**
-   Sandboxes are the hardest isolation story and should not block the first
-   useful release.
-3. **Storage before Workers, because Workers need a place to put bundles and
-   logs.** It is also the easiest bill to replace.
-4. **Workers before CI, because CI can run without the control plane.** Fireactions
-   and Woodpecker work standalone; Workers on owned hardware needs the agent,
-   routing and bundle pipeline.
-5. **Hardening last, but not optional.** A system that works in a demo and fails
-   at 3 a.m. is not a replacement for Cloudflare.
+1. Control plane first: the runtimes are replaceable, the protocol and data model
+   are not.
+2. Broker before workloads: nothing else can be trusted until enrollment,
+   transport and local state work.
+3. Workers before containers: `lite` is the hardest constraint and the clearest
+   differentiator.
+4. Storage before sandboxes: bundles and logs need a place to live, and storage is
+   the easiest bill to replace.
+5. CI last: Fireactions and Woodpecker run standalone, so CI is not blocked by
+   the control plane.
 
 ## What not to build
 
-- A hypervisor, an S3 server, a CI engine, a Durable Object runtime, a container
-  runtime, a service mesh, or a global scheduler.
-- A billing marketplace, a tenant self-service signup, or a status page in v1.
+- A hypervisor, S3 server, CI engine, Durable Object runtime, container runtime,
+  service mesh or global scheduler.
+- A billing marketplace, tenant self-signup or public status page in v1.
 - A Kubernetes distribution.
-- A custom VPN or tunnel protocol. Use `cloudflared`; add a relay, not a new
-  protocol.
+- A custom VPN or tunnel protocol.
 - A Windows guest story in v1.
 - A multi-region active-active control plane in v1.
 
-## Staffing and calendar
-
-These are estimates, not commitments. They assume one experienced generalist
-working full time, with access to at least two machines and a Cloudflare account.
-
-| Phase | Estimate | Confidence |
-| --- | --- | --- |
-| 0 | 2 weeks | Medium |
-| 1 | 4 to 6 weeks | Medium |
-| 2 | 6 to 8 weeks | Low |
-| 3 | 4 to 6 weeks | Medium |
-| 4 | 4 to 6 weeks | Low |
-| 5 | 4 to 6 weeks | Low |
-| 6 | 3 to 4 weeks | Medium |
-| 7 | ongoing | n/a |
-
-The low-confidence phases depend on the spikes in Phase 0. If Firecracker or
-celld does not behave, the phase grows.
-
 ## Success metrics
 
-- Time to enroll a machine: under 10 minutes.
-- Time to first workload: under 5 minutes after enrollment.
-- Control-plane availability: 99.9% monthly.
+- Enroll a node in under 10 minutes.
+- First workload in under 5 minutes after enrollment.
+- Control-plane availability 99.9% monthly.
 - Workload survival during a control-plane outage: 100%.
 - Restore drill success: 100% of monthly drills.
 - Audit chain verification: 100% of daily checks.
-- Cost per workload: lower than the Cloudflare equivalent for the target shape,
-  including operator time, or the project is honest that it is not.
+- Cost per workload lower than the Cloudflare equivalent for the target shape,
+  including operator time, or the design says plainly that it is not.

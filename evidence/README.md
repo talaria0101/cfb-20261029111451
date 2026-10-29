@@ -7,7 +7,7 @@ bug.
 
 ## `repos.tsv`
 
-One row per repository, 99 repository rows plus a header row.
+One row per repository, 105 repository rows plus a header row.
 
 Columns:
 
@@ -37,7 +37,7 @@ Caveats:
 
 ## `repos.raw.jsonl`
 
-The raw JSON objects for the same 99 repositories, one per line, from the same
+The raw JSON objects for the same 105 repositories, one per line, from the same
 API calls. This is the source for `repos.tsv`. It is larger and less convenient,
 but it preserves fields that the TSV drops (owner, default branch, open issues,
 topics, licence URL).
@@ -93,7 +93,10 @@ is the raw Cap'n Proto configuration from the workerd repository, saved because
 it is the primary source for the experimental Durable Object cluster claim.
 
 These are the projects' own claims. They were not tested. A performance number in
-a README is not a measurement of the project on your hardware.
+a README is not a measurement of the project on your hardware. The six projects
+added on 2026-10-29 for design patterns (homelable, CoreObs, omnyssh, ServerBee,
+mirrord, cfrs) were read, not run. Four of them are not brokers, and none is a
+Cloudflare backend.
 
 Included projects:
 
@@ -102,6 +105,7 @@ awesome-cloudflare-selfhosted
 cloudflare_workerd
 codician-team_diffinery
 coollabsio_coolify
+crocofied_CoreObs
 denoland_celld
 Dokploy_dokploy
 elliothux_open-compute
@@ -110,18 +114,25 @@ firecracker-microvm_firecracker
 fosrl_pangolin
 giuseppelt_self-workerd
 gofixpoint_amika
+gofixpoint_amika_hostd
+gofixpoint_amika_self-hosting
 harmont-dev_hyper
 hostinger_fireactions
 lxc_incus
 mathaix_OpenClawMachines
+metalbear-co_mirrord
+Pouzor_homelable
 rivet-dev_rivet
 rustfs_rustfs
 sahil-shubham_bhatti
 seaweedfs_seaweedfs
 solcreek_groundflare
+talaria0101_cfrs
+timhartmann7_omnyssh
 VaalaCat_vorker
 wdl-dev_wdl
 woodpecker-ci_woodpecker
+ZingerLittleBee_ServerBee
 ```
 
 Missing from this set, but used in the documents through the API metadata or a

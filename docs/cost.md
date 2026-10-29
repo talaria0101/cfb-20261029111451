@@ -140,12 +140,12 @@ Assume 10 machines, 10 tenants, 100,000 API requests per month, 1 GB of metadata
 - D1: 1 GB storage, within 5 GB. Rows read and written are far below 25B/50M.
   $0.
 - DO: 10 machines * 172,800 heartbeats/month = 1,728,000 requests. Included is
-  1M, so 728,000 over. Cloudflare rounds billable usage up to the next million
-  requests, so 1M billable * $0.15/M = $0.15. Duration depends on hibernation;
-  if each DO is active only during a request, duration is small. If each DO is
-  active continuously at 128 MB: `10 * 0.128 GB * 730 h * 3,600 = 3,363,840
-  GB-s`; over 400,000 by 2,963,840; rounded up to 3,000,000 GB-s; `3 * $12.50 =
-  $37.50`. Hibernation matters.
+  1M, so 728,000 over. The billing page rounds billable usage up to the next
+  million requests, so 1M billable * $0.15/M = $0.15. Duration depends on
+  hibernation; if each DO is active only during a request, duration is small. If
+  each DO is active continuously at 128 MB: `10 * 0.128 GB * 730 h * 3,600 =
+  3,363,840 GB-s`; over 400,000 by 2,963,840; rounded up to 3,000,000 GB-s; `3 *
+  $12.50 = $37.50`. Hibernation matters.
 - R2: 10 GB of logs and artifacts, within the free tier. $0.
 - Queues: under 1M operations. $0.
 - Tunnels: 10, within 1,000. $0.
@@ -155,7 +155,47 @@ Control-plane total: **$5.15 to about $43/month**, dominated by DO duration if t
 per-machine objects never hibernate. Design the DO to hibernate and use alarms;
 otherwise the cheap control plane is not cheap.
 
-### 2.5 Workers CI at the limit
+### 2.5 Relay WebSocket cost
+
+The default transport is one WebSocket per machine, terminated by a Durable
+Object. Billing is not one request per message. Cloudflare's DO pricing page
+says: a request is needed to create the WebSocket connection; outgoing messages
+and WebSocket protocol pings are free; incoming messages are billed at a 20:1
+ratio for request billing. A message is one fifth of the old assumption.
+
+Heartbeats, at one incoming message per machine every 15 seconds:
+
+```
+10 machines * 172,800 = 1,728,000 incoming messages/month
+1,728,000 / 20 = 86,400 billable requests
+86,400 is under the 1M included; $0
+```
+
+Ingress and logs add incoming messages. A site serving 1M HTTP requests/month
+with two incoming relay messages per request:
+
+```
+2,000,000 / 20 = 100,000 billable requests
+100,000 * $0.15/M = $0.015
+```
+
+A workload that streams 1 GB of logs in 64 KiB frames sends 16,384 messages,
+billed as 819 requests, about $0.0001. At 1 KB frames the same gigabyte sends
+1,048,576 messages, billed as 52,429 requests, about $0.008. Frame size still
+matters, but the ratio makes the relay cheap for control traffic.
+
+Duration is billed while the DO is active. With the hibernation API, an idle
+socket does not hold the object in memory; a message wakes it. A DO that never
+hibernates costs `0.128 GB * 730 h * 3,600 = 336,384 GB-s`; at $12.50/M GB-s that
+is `0.336384 * $12.50 = $4.20/month` per machine at 128 MB. Hibernation is
+required, not optional.
+
+The relay still adds a hop and a per-machine failure domain. Native Cloudflare
+Tunnel removes the DO from the data path and is better for sustained throughput.
+Use the relay where the network forbids UDP, and the native tunnel or direct S3
+where throughput dominates.
+
+### 2.6 Workers CI at the limit
 
 6,000 minutes included. A heavy project using 10,000 minutes:
 
@@ -360,7 +400,7 @@ These are the costs that make a "free" self-hosted stack expensive:
 The architecture should make cost visible and bounded:
 
 - Every workload has a quota: CPU, memory, disk, egress, and a TTL for sandboxes.
-- A sandbox without a TTL is a bug; the agent enforces a maximum.
+- A sandbox without a TTL is a bug; the broker enforces a maximum.
 - Idle containers can scale to zero on a schedule, not only on request.
 - Storage lifecycle: hot -> warm -> R2 IA -> delete, with a policy per bucket.
 - Snapshot retention is explicit; a snapshot without an expiry is rejected.
